@@ -8,6 +8,7 @@
 conda create -n sargent python=3.11 cmake=3.14.0
 conda activate sargent
 conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install -r requirements.txt
 ```
 
 2. Install [VGGT](https://github.com/facebookresearch/vggt) and its dependencies as a python package.
