@@ -143,6 +143,21 @@ def to_Colmap(scene_dir, conf_thres_value):
         depth = depth.copy()
         depth[~conf_mask_original[i]] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
 
+        # rotate depth to original image size
+        depth = np.rot90(depth, k=3)  # rotate to match original orientation
+
+        # place depth in original image size
+        orig_h, orig_w = original_coords[i, -2:].cpu().numpy().astype(int)
+
+        # calculate the scale factor used to resize original image to square image
+        scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
+        # calculate the padding added to the original image to make it square
+        # after resizing, the padding should also be scaled
+        pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
+        pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+
+        depth = depth[pad_h: pad_h + int(orig_h * scale_factor), pad_w: pad_w + int(orig_w * scale_factor)]
+        
         # normalize depth for visualization
         depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
         depth_img = np.clip(depth_img, 0.0, 1.0)

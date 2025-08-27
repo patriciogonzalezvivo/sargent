@@ -76,12 +76,12 @@ class TestDataset(Dataset):
             #TEED BIPED standard proposal if you want speed up the test, comment this block
             img = cv2.resize(img, (0, 0), fx=1.5, fy=1.5)
 
-        # if it's too large, downscale it to 1024p mantaining aspect ratio
-        if img.shape[0] > 1024 or img.shape[1] > 1024:
-            if img.shape[0] > img.shape[1]:
-                scale = 1024 / img.shape[0]
+        # if it's too large, downscale the max dimension to the min of img_height, img_width
+        if img.shape[0] > self.img_height or img.shape[1] > self.img_width:
+            if img.shape[0] >= img.shape[1]:
+                scale = self.img_height / img.shape[0]
             else:
-                scale = 1024 / img.shape[1]
+                scale = self.img_width / img.shape[1]
             img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
             
         # Make sure images and labels are divisible by 2^4=16
