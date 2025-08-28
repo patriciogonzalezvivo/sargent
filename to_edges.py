@@ -255,8 +255,8 @@ def run(input_image_path, output_image_path, args):
     edge[edge > threshold_value] = 255.0
     edge[edge <= threshold_value] = 0.0
 
-    # Save edge map
-    cv2.imwrite(output_png_path, edge)
+    # # Save edge map
+    # cv2.imwrite(output_png_path, edge)
 
     margin = [args.margin, args.margin]
     marks = 5

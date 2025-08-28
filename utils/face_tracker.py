@@ -71,8 +71,8 @@ from mediapipe.framework.formats import landmark_pb2
 #     return annotated_image
 
 
-class NoFacesFoundException(Exception):
-    pass
+# class NoFacesFoundException(Exception):
+#     pass
 
 
 # def face2mesh(face_img: np.ndarray) -> Tuple[pv.PolyData, np.ndarray]:
@@ -174,12 +174,11 @@ def image_to_guidelines(image: np.ndarray, translate: tuple = (0, 0), scale: tup
         max_num_faces=1, 
         refine_landmarks=True, 
         min_detection_confidence=0.5, 
-        # output_facial_transformation_matrixes=True,
         ) as face_mesh:
         results = face_mesh.process(image)
 
         if not results.multi_face_landmarks:
-            raise NoFacesFoundException()
+            return []
         
         [face_landmarks] = results.multi_face_landmarks
 
