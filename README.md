@@ -15,7 +15,6 @@ pip install -r requirements.txt
 ```
 git clone https://github.com/facebookresearch/vggt.git
 cd vggt
-pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -25,6 +24,7 @@ This repository combines different models
 
 * [VGGT](https://github.com/facebookresearch/vggt) under [dedicated VGGT License](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt)
 * [TEED](https://github.com/xavysp/TEED/tree/main) under [MIT License](https://github.com/xavysp/TEED/blob/main/LICENSE)
+* [Mediapipe](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) under [Apache License 2.0](https://github.com/google/mediapipe/blob/main/LICENSE)
 
 
 

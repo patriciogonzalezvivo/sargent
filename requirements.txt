@@ -6,3 +6,7 @@ transformers>=4.40.1
 opencv-python>=4.5.0
 numpy>=1.26.4
 huggingface-hub
+Pillow
+einops
+safetensors
+mediapipe

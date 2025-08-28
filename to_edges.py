@@ -12,14 +12,18 @@ import cv2
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from ted import TED # TEED architecture
-
-from utils.AxiSurface.AxiSurface import AxiSurface, Path, convert
-from skimage.morphology import skeletonize
-
+# TEED (Tiny Edge-Enhancement Distillation) model
+from ted import TED
 device = torch.device('cpu' if torch.cuda.device_count() == 0 else 'cuda')
 checkpoint_path = 'checkpoints/teed.pth'
 model = None
+
+# Edge to Vector
+from utils.AxiSurface.AxiSurface import AxiSurface, Path, convert
+from skimage.morphology import skeletonize
+
+# Facetracker
+from utils.face_tracker import image_to_guidelines
 
 
 def parse_args():
@@ -38,27 +42,44 @@ def parse_args():
 
     parser.add_argument('--up_scale',
                         type=bool,
-                        default=False, # for Upsale test set in 30%
+                        default=True, # for Upsale test set in 30%
                         help='True: up scale x1.5 test image')  # Just for test
 
     parser.add_argument('--img_width',
                         type=int,
-                        default=512*2,
+                        default=512,
                         help='Image width for testing.')
     parser.add_argument('--img_height',
                         type=int,
-                        default=512*2,
+                        default=512,
                         help='Image height for testing.')
     
     parser.add_argument('--use_gpu',type=int,
                         default=0, help='use GPU')
-    parser.add_argument('--workers',
-                        default=8,
-                        type=int,
-                        help='The number of workers for the dataloaders.')
+    
     parser.add_argument('--mean',
                         default=[104.007, 116.669, 122.679, 137.86],
                         type=float)
+    
+    parser.add_argument('--threshold',
+                        type=float,
+                        default=0.97,
+                        help='The threshold to convert the probability map to binary map.')
+    
+    parser.add_argument('--scale',
+                        type=float,
+                        default=0.65,
+                        help='scale the input image')
+    
+    parser.add_argument('--margin',
+                        type=int,
+                        default=10,
+                        help='margin for the input image')
+    
+    parser.add_argument('--epsilon',
+                        type=float,
+                        default=0.0001,
+                        help='epsilon factor for approxPolyDP')
 
     args = parser.parse_args()
     return args
@@ -109,7 +130,7 @@ def extract_contours(image, threshold=0.5, scale=1.0, translate=(0,0), epsilon_f
     else:
         gray = image
 
-    _, binary = cv2.threshold(gray, 125, 255, cv2.THRESH_BINARY)
+    _, binary = cv2.threshold(gray, int(255 * threshold), 255, cv2.THRESH_BINARY)
 
     #invert binary image
     binary = cv2.bitwise_not(binary)
@@ -143,49 +164,15 @@ def extract_coorners(gray, scale=1.0, translate=(0,0)):
             (gray_with*scale+translate[0],gray_height*scale+translate[1])]
 
 
-def run_TEED(input_image_path, output_image_path, img_size=(512, 512), mean_bgr=[104.007, 116.669, 122.679, 137.86],resize_input=False, up_scale=False):
+def image_to_edge(input_image, mean_bgr=[104.007, 116.669, 122.679, 137.86], resize_input=False):
     global model
     if model is None:
         model = init_model()
-
-    output_filename = output_image_path.split('.')[0]
-    output_png_path = output_filename + '.png'
-    output_svg_path = output_filename + '.svg'
-
-    # load image
-    image = cv2.imread(input_image_path, cv2.IMREAD_COLOR)
-
-    print(f"{input_image_path}: {image.shape}")
+    
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
-    # gt[gt< 51] = 0 # test without gt discrimination
-        # up scale test image
-    if up_scale:
-        # For TEED BIPBRIlight Upscale
-        image = cv2.resize(image,(0,0),fx=1.3,fy=1.3)
-
-    if image.shape[0] < img_size[0] or image.shape[1] < img_size[1]:
-        #TEED BIPED standard proposal if you want speed up the test, comment this block
-        image = cv2.resize(image, (0, 0), fx=1.5, fy=1.5)
-
-    # if it's too large, downscale the max dimension to the min of img_height, img_width
-    if image.shape[0] > img_size[0] or image.shape[1] > img_size[1]:
-        if image.shape[0] >= image.shape[1]:
-            scale = img_size[0] / image.shape[0]
-        else:
-            scale = img_size[1] / image.shape[1]
-        image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
-        
-    # Make sure images and labels are divisible by 2^4=16
-    if image.shape[0] % 8 != 0 or image.shape[1] % 8 != 0:
-        img_width = ((image.shape[1] // 8) + 1) * 8
-        img_height = ((image.shape[0] // 8) + 1) * 8
-        image = cv2.resize(image, (img_width, img_height))
-    else:
-        pass
-
-    image = np.array(image, dtype=np.float32)
+    image = np.array(input_image, dtype=np.float32)
 
     image -= mean_bgr if len(mean_bgr) == 3 else mean_bgr[:3]
     image = image.transpose((2, 0, 1))
@@ -215,22 +202,70 @@ def run_TEED(input_image_path, output_image_path, img_size=(512, 512), mean_bgr=
             else:
                 fuse = np.maximum(fuse, tmp)
 
-    edge = fuse
+    torch.cuda.empty_cache()
 
-    # # thresholding to make the edge more clear
-    threshold_value = 250
+    return fuse
+
+
+def run(input_image_path, output_image_path, args):
+
+    # prepare paths and parameters
+    output_filename = output_image_path.split('.')[0]
+    output_png_path = output_filename + '.png'
+    output_svg_path = output_filename + '.svg'
+    img_size = (args.img_height, args.img_width)
+    
+    # load image
+    image = cv2.imread(input_image_path, cv2.IMREAD_COLOR)
+    image_original = image.copy()
+    image_original_size = [image_original.shape[0], image_original.shape[1]]
+
+    # Pre-process image
+    if args.up_scale:
+        # For TEED BIPBRIlight Upscale
+        image = cv2.resize(image,(0,0),fx=1.3,fy=1.3)
+
+    if image.shape[0] < img_size[0] or image.shape[1] < img_size[1]:
+        #TEED BIPED standard proposal if you want speed up the test, comment this block
+        image = cv2.resize(image, (0, 0), fx=1.5, fy=1.5)
+
+    # if it's too large, downscale the max dimension to the min of img_height, img_width
+    if image.shape[0] > img_size[0] or image.shape[1] > img_size[1]:
+        if image.shape[0] >= image.shape[1]:
+            scale = img_size[0] / image.shape[0]
+        else:
+            scale = img_size[1] / image.shape[1]
+        image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
+        
+    # Make sure images and labels are divisible by 2^4=16
+    if image.shape[0] % 8 != 0 or image.shape[1] % 8 != 0:
+        img_width = ((image.shape[1] // 8) + 1) * 8
+        img_height = ((image.shape[0] // 8) + 1) * 8
+        image = cv2.resize(image, (img_width, img_height))
+
+    img_height, img_width = image.shape[0], image.shape[1]
+
+    print(f"{input_image_path}: {image_original_size} -> {(img_height, img_width)}")
+
+    # Predict SotA edge detection
+    edge = image_to_edge(image, mean_bgr=args.mean)
+    
+    # Thresholding to make the edge more clear
+    threshold_value = int(256.0 * args.threshold)
     edge[edge > threshold_value] = 255.0
     edge[edge <= threshold_value] = 0.0
 
-    # Save fused edge map
+    # Save edge map
     cv2.imwrite(output_png_path, edge)
 
-    margin = [10, 10]
+    margin = [args.margin, args.margin]
     marks = 5
-    scale = 0.35
-    print(edge.shape)
-    vector_paths = extract_contours(edge, scale=scale, translate=margin, epsilon_factor=0.0001)
-    coorners = extract_coorners(edge, scale=scale, translate=margin)
+
+    vector_paths = extract_contours(edge, scale=args.scale, translate=margin, epsilon_factor=args.epsilon)
+    coorners = extract_coorners(edge, scale=args.scale, translate=margin)
+
+    width = coorners[1][0] - coorners[0][0]
+    height = coorners[3][1] - coorners[0][1]
 
     # add intermediate points between coorners 
     p1 = coorners[0]
@@ -244,6 +279,9 @@ def run_TEED(input_image_path, output_image_path, img_size=(512, 512), mean_bgr=
         coorners.append( (p1[0]+(p3[0]-p1[0])*i/inter_num, p1[1]+(p3[1]-p1[1])*i/inter_num) )
         coorners.append( (p2[0]+(p4[0]-p2[0])*i/inter_num, p2[1]+(p4[1]-p2[1])*i/inter_num) )
 
+    guidelines = image_to_guidelines(image_original,
+                                     scale=(width, height),
+                                     translate=margin)
 
     axi = AxiSurface(size='12in x 16in')
 
@@ -253,10 +291,9 @@ def run_TEED(input_image_path, output_image_path, img_size=(512, 512), mean_bgr=
         axi.line( [coorner[0], coorner[1]-marks], [coorner[0], coorner[1]+marks])
 
     axi.path( Path(vector_paths).getSimplify(2.0).getSorted())
+    axi.path(Path( guidelines ).getSorted())
 
     axi.toSVG(output_svg_path)
-    
-    torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
@@ -268,14 +305,10 @@ if __name__ == '__main__':
             if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
                 input_image_path = os.path.join(args.input, filename)
                 output_image_path = os.path.join(args.output, os.path.splitext(filename)[0] + '.png')
-                run_TEED(input_image_path=input_image_path,
-                         output_image_path=output_image_path,
-                         img_size=(args.img_width, args.img_height),
-                         up_scale=args.up_scale,
-                         mean_bgr=args.mean)
+                run(input_image_path=input_image_path,
+                    output_image_path=output_image_path,
+                    args=args)
     else:
-        run_TEED(input_image_path=args.input,
-                output_image_path=args.output,
-                img_size=(args.img_width, args.img_height),
-                up_scale=args.up_scale,
-                mean_bgr=args.mean)
+        run(input_image_path=args.input,
+            output_image_path=args.output,
+            args=args)
