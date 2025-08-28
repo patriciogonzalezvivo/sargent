@@ -5,7 +5,6 @@ from __future__ import print_function
 
 import argparse
 import os
-import time
 import numpy as np
 os.environ['CUDA_LAUNCH_BLOCKING']="0"
 
@@ -15,96 +14,54 @@ from torch.utils.data import Dataset, DataLoader
 
 from ted import TED # TEED architecture
 
+from utils.AxiSurface.AxiSurface import AxiSurface, Path, convert
+from skimage.morphology import skeletonize
 
-class TestDataset(Dataset):
-    def __init__(self,
-                 data_root='data',
-                 img_height=512,
-                 img_width=512,
-                 up_scale=False,
-                 mean_test=[104.007, 116.669, 122.679, 137.86],
-                 ):
+device = torch.device('cpu' if torch.cuda.device_count() == 0 else 'cuda')
+checkpoint_path = 'checkpoints/teed.pth'
+model = None
 
-        self.data_root = data_root
-        self.up_scale = up_scale
-        self.mean_bgr = mean_test if len(mean_test) == 3 else mean_test[:3]
-        self.img_height = img_height
-        self.img_width = img_width
-        self.data_index = self._build_index()
 
-    def _build_index(self):
-        sample_indices = []
-        # for single image testing
-        images_path = os.listdir(self.data_root)
-        labels_path = None
-        sample_indices = [images_path, labels_path]
-        return sample_indices
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Run TEED model')
 
-    def __len__(self):
-        return len(self.data_index[0])
+    # Data parameters
+    parser.add_argument('--input',
+                        type=str,
+                        default='data',
+                        help='the path to the directory with the input data for validation.')
+    parser.add_argument('--output',
+                        type=str,
+                        default='results',
+                        help='the path to output the results.')
 
-    def __getitem__(self, idx):
-        # get data sample
-        # image_path, label_path = self.data_index[idx]
-        if self.data_index[1] is None:
-            image_path = self.data_index[0][idx] if len(self.data_index[0]) > 1 else self.data_index[0][idx - 1]
-        else:
-            image_path = self.data_index[idx][0]
+    parser.add_argument('--up_scale',
+                        type=bool,
+                        default=False, # for Upsale test set in 30%
+                        help='True: up scale x1.5 test image')  # Just for test
 
-        img_name = os.path.basename(image_path)
-        file_name = os.path.splitext(img_name)[0] + ".png"
+    parser.add_argument('--img_width',
+                        type=int,
+                        default=512*2,
+                        help='Image width for testing.')
+    parser.add_argument('--img_height',
+                        type=int,
+                        default=512*2,
+                        help='Image height for testing.')
+    
+    parser.add_argument('--use_gpu',type=int,
+                        default=0, help='use GPU')
+    parser.add_argument('--workers',
+                        default=8,
+                        type=int,
+                        help='The number of workers for the dataloaders.')
+    parser.add_argument('--mean',
+                        default=[104.007, 116.669, 122.679, 137.86],
+                        type=float)
 
-        img_dir = self.data_root
-
-        # load data
-        image = cv2.imread(os.path.join(img_dir, image_path), cv2.IMREAD_COLOR)
-        label = None
-
-        im_shape = [image.shape[0], image.shape[1]]
-        image, label = self.transform(img=image, gt=label)
-
-        return dict(images=image, labels=label, file_names=file_name, image_shape=im_shape)
-
-    def transform(self, img, gt):
-        # gt[gt< 51] = 0 # test without gt discrimination
-        # up scale test image
-        if self.up_scale:
-            # For TEED BIPBRIlight Upscale
-            img = cv2.resize(img,(0,0),fx=1.3,fy=1.3)
-
-        if img.shape[0] < 512 or img.shape[1] < 512:
-            #TEED BIPED standard proposal if you want speed up the test, comment this block
-            img = cv2.resize(img, (0, 0), fx=1.5, fy=1.5)
-
-        # if it's too large, downscale the max dimension to the min of img_height, img_width
-        if img.shape[0] > self.img_height or img.shape[1] > self.img_width:
-            if img.shape[0] >= img.shape[1]:
-                scale = self.img_height / img.shape[0]
-            else:
-                scale = self.img_width / img.shape[1]
-            img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
-            
-        # Make sure images and labels are divisible by 2^4=16
-        if img.shape[0] % 8 != 0 or img.shape[1] % 8 != 0:
-            img_width = ((img.shape[1] // 8) + 1) * 8
-            img_height = ((img.shape[0] // 8) + 1) * 8
-            img = cv2.resize(img, (img_width, img_height))
-        else:
-            pass
-
-        img = np.array(img, dtype=np.float32)
-
-        img -= self.mean_bgr
-        img = img.transpose((2, 0, 1))
-        img = torch.from_numpy(img.copy()).float()
-
-        gt = np.array(gt, dtype=np.float32)
-        if len(gt.shape) == 3:
-            gt = gt[:, :, 0]
-        gt /= 255.
-        gt = torch.from_numpy(np.array([gt])).float()
-
-        return img, gt
+    args = parser.parse_args()
+    return args
 
 
 def image_normalization(img, img_min=0, img_max=255,
@@ -127,159 +84,13 @@ def image_normalization(img, img_min=0, img_max=255,
     return img
 
 
-def save_image_batch_to_disk(tensor, output_dir, file_names, img_shape=None):
-    os.makedirs(output_dir, exist_ok=True)
+def init_model():
+    global model
+
+    if model is not None:
+        return model
     
-    tensor2=None
-    tmp_img2 = None
-
-    # 255.0 * (1.0 - em_a)
-    edge_maps = []
-    for i in tensor:
-        tmp = torch.sigmoid(i).cpu().detach().numpy()
-        edge_maps.append(tmp)
-    tensor = np.array(edge_maps)
-    # print(f"tensor shape: {tensor.shape}")
-
-    image_shape = [x.cpu().detach().numpy() for x in img_shape]
-    # (H, W) -> (W, H)
-    image_shape = [[y, x] for x, y in zip(image_shape[0], image_shape[1])]
-
-    assert len(image_shape) == len(file_names)
-
-    idx = 0
-    for i_shape, file_name in zip(image_shape, file_names):
-        tmp = tensor[:, idx, ...]
-        tmp2 = tensor2[:, idx, ...] if tensor2 is not None else None
-        # tmp = np.transpose(np.squeeze(tmp), [0, 1, 2])
-        tmp = np.squeeze(tmp)
-        tmp2 = np.squeeze(tmp2) if tensor2 is not None else None
-
-        # Iterate our all 7 NN outputs for a particular image
-        preds = []
-        fuse_num = tmp.shape[0]-1
-        for i in range(tmp.shape[0]):
-            tmp_img = tmp[i]
-            tmp_img = np.uint8(image_normalization(tmp_img))
-            tmp_img = cv2.bitwise_not(tmp_img)
-            # tmp_img[tmp_img < 0.0] = 0.0
-            # tmp_img = 255.0 * (1.0 - tmp_img)
-            if tmp2 is not None:
-                tmp_img2 = tmp2[i]
-                tmp_img2 = np.uint8(image_normalization(tmp_img2))
-                tmp_img2 = cv2.bitwise_not(tmp_img2)
-
-            # Resize prediction to match input image size
-            if not tmp_img.shape[1] == i_shape[0] or not tmp_img.shape[0] == i_shape[1]:
-                tmp_img = cv2.resize(tmp_img, (i_shape[0], i_shape[1]))
-                tmp_img2 = cv2.resize(tmp_img2, (i_shape[0], i_shape[1])) if tmp2 is not None else None
-
-            if tmp2 is not None:
-                tmp_mask = np.logical_and(tmp_img>128,tmp_img2<128)
-                tmp_img= np.where(tmp_mask, tmp_img2, tmp_img)
-                preds.append(tmp_img)
-
-            else:
-                preds.append(tmp_img)
-
-            if i == fuse_num:
-                # print('fuse num',tmp.shape[0], fuse_num, i)
-                fuse = tmp_img
-                fuse = fuse.astype(np.uint8)
-                if tmp_img2 is not None:
-                    fuse2 = tmp_img2
-                    fuse2 = fuse2.astype(np.uint8)
-                    # fuse = fuse-fuse2
-                    fuse_mask=np.logical_and(fuse>128,fuse2<128)
-                    fuse = np.where(fuse_mask,fuse2, fuse)
-
-                    # print(fuse.shape, fuse_mask.shape)
-
-        # Save predicted edge maps
-        average = np.array(preds, dtype=np.float32)
-        average = np.uint8(np.mean(average, axis=0))
-        output_file_name = os.path.join(output_dir, file_name)
-        cv2.imwrite(output_file_name, fuse)
-
-        idx += 1
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='TEED model')
-    parser.add_argument('--choose_test_data',
-                        type=int,
-                        default=-1,     # UDED=15
-                        help='Choose a dataset for testing: 0 - 15')
-
-    # Data parameters
-    parser.add_argument('--input_dir',
-                        type=str,
-                        default='data',
-                        help='the path to the directory with the input data for validation.')
-    parser.add_argument('--output_dir',
-                        type=str,
-                        default='results',
-                        help='the path to output the results.')
-
-    parser.add_argument('--test_list',
-                        type=str,
-                        default=None,
-                        help='Dataset sample indices list.')
-    parser.add_argument('--up_scale',
-                        type=bool,
-                        default=False, # for Upsale test set in 30%
-                        help='True: up scale x1.5 test image')  # Just for test
-
-    parser.add_argument('--checkpoint_data',
-                        type=str,
-                        default='checkpoints/teed.pth',# 37 for biped 60 MDBD
-                        help='Checkpoint path.')
-    parser.add_argument('--img_width',
-                        type=int,
-                        default=512,
-                        help='Image width for testing.')
-    parser.add_argument('--img_height',
-                        type=int,
-                        default=512,
-                        help='Image height for testing.')
-    
-    parser.add_argument('--use_gpu',type=int,
-                        default=0, help='use GPU')
-    parser.add_argument('--workers',
-                        default=8,
-                        type=int,
-                        help='The number of workers for the dataloaders.')
-    parser.add_argument('--mean_test',
-                        default=[104.007, 116.669, 122.679, 137.86],
-                        type=float)
-
-    args = parser.parse_args()
-    return args
-
-
-def run_TEED(checkpoint_path, input_dir, output_dir, img_size=(512, 512), mean_test=[104.007, 116.669, 122.679, 137.86], num_workers=8, resize_input=False, up_scale=False):
-    # torch.autograd.set_detect_anomaly(True)
-
-    # Get computing device
-    device = torch.device('cpu' if torch.cuda.device_count() == 0 else 'cuda')
-
-    # Instantiate model and move it to the computing device
     model = TED().to(device)
-
-    dataset = TestDataset(  input_dir,
-                            img_width=img_size[0],
-                            img_height=img_size[1],
-                            up_scale=up_scale,
-                            mean_test=mean_test)
-    
-    print(dataset)
-                              
-    dataloader = DataLoader(dataset,
-                            batch_size=1,
-                            shuffle=False,
-                            num_workers=num_workers)
-
 
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(
@@ -288,36 +99,183 @@ def run_TEED(checkpoint_path, input_dir, output_dir, img_size=(512, 512), mean_t
     print(f"Restoring weights from: {checkpoint_path}")
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()
+    return model
 
-    with torch.no_grad():
-        print(f"output_dir: {output_dir}")
-        for _, sample_batched in enumerate(dataloader):
-            images = sample_batched['images'].to(device)
-            file_names = sample_batched['file_names']
-            image_shape = sample_batched['image_shape']
 
-            print(f"{file_names}: {images.shape}")
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
+def extract_contours(image, threshold=0.5, scale=1.0, translate=(0,0), epsilon_factor=0.0001):
+    # convert image to gray if it is not
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
 
-            preds = model(images, single_test=resize_input)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
+    _, binary = cv2.threshold(gray, 125, 255, cv2.THRESH_BINARY)
 
-            save_image_batch_to_disk(preds,
-                                     output_dir, # output_dir
-                                     file_names,
-                                     image_shape)
-            
-            torch.cuda.empty_cache()
+    #invert binary image
+    binary = cv2.bitwise_not(binary)
+
+    skeleton = skeletonize(binary // 255)
+    skeleton_display = (skeleton * 255).astype(np.uint8)
+
+    # 2. Find Contours
+    contours, _ = cv2.findContours(skeleton_display, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    vector_paths = []
+    for contour in contours:
+        # 3. Approximate Contours
+        epsilon = epsilon_factor * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        
+        # 4. Scale and Translate
+        points = [(point[0][0] * scale + translate[0], point[0][1] * scale + translate[1]) for point in approx]
+        if len(points) > 1:
+            vector_paths.append(points)
+
+    return Path(vector_paths)
+
+
+def extract_coorners(gray, scale=1.0, translate=(0,0)):
+    gray_with = gray.shape[1]
+    gray_height = gray.shape[0]
+    return [(0*scale+translate[0],0*scale+translate[1]),
+            (gray_with*scale+translate[0],0*scale+translate[1]),
+            (0*scale+translate[0],gray_height*scale+translate[1]),
+            (gray_with*scale+translate[0],gray_height*scale+translate[1])]
+
+
+def run_TEED(input_image_path, output_image_path, img_size=(512, 512), mean_bgr=[104.007, 116.669, 122.679, 137.86],resize_input=False, up_scale=False):
+    global model
+    if model is None:
+        model = init_model()
+
+    output_filename = output_image_path.split('.')[0]
+    output_png_path = output_filename + '.png'
+    output_svg_path = output_filename + '.svg'
+
+    # load image
+    image = cv2.imread(input_image_path, cv2.IMREAD_COLOR)
+
+    print(f"{input_image_path}: {image.shape}")
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    # gt[gt< 51] = 0 # test without gt discrimination
+        # up scale test image
+    if up_scale:
+        # For TEED BIPBRIlight Upscale
+        image = cv2.resize(image,(0,0),fx=1.3,fy=1.3)
+
+    if image.shape[0] < img_size[0] or image.shape[1] < img_size[1]:
+        #TEED BIPED standard proposal if you want speed up the test, comment this block
+        image = cv2.resize(image, (0, 0), fx=1.5, fy=1.5)
+
+    # if it's too large, downscale the max dimension to the min of img_height, img_width
+    if image.shape[0] > img_size[0] or image.shape[1] > img_size[1]:
+        if image.shape[0] >= image.shape[1]:
+            scale = img_size[0] / image.shape[0]
+        else:
+            scale = img_size[1] / image.shape[1]
+        image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
+        
+    # Make sure images and labels are divisible by 2^4=16
+    if image.shape[0] % 8 != 0 or image.shape[1] % 8 != 0:
+        img_width = ((image.shape[1] // 8) + 1) * 8
+        img_height = ((image.shape[0] // 8) + 1) * 8
+        image = cv2.resize(image, (img_width, img_height))
+    else:
+        pass
+
+    image = np.array(image, dtype=np.float32)
+
+    image -= mean_bgr if len(mean_bgr) == 3 else mean_bgr[:3]
+    image = image.transpose((2, 0, 1))
+    image = torch.from_numpy(image.copy()).float().unsqueeze(0).to(device)
+        
+    preds = model(image, single_test=resize_input)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    fuse_num = len(preds)
+
+    # Fuse predictions
+    fuse = None
+    if fuse_num > 0:
+        fuse = torch.sigmoid(preds[0]).cpu().detach().numpy()
+        fuse = np.squeeze(fuse)
+        fuse = np.uint8(image_normalization(fuse))
+        fuse = cv2.bitwise_not(fuse)
+
+        for i in range(1, fuse_num):
+            tmp = torch.sigmoid(preds[i]).cpu().detach().numpy()
+            tmp = np.squeeze(tmp)
+            tmp = np.uint8(image_normalization(tmp))
+            tmp = cv2.bitwise_not(tmp)
+            if fuse is None:
+                fuse = tmp
+            else:
+                fuse = np.maximum(fuse, tmp)
+
+    edge = fuse
+
+    # # thresholding to make the edge more clear
+    threshold_value = 250
+    edge[edge > threshold_value] = 255.0
+    edge[edge <= threshold_value] = 0.0
+
+    # Save fused edge map
+    cv2.imwrite(output_png_path, edge)
+
+    margin = [10, 10]
+    marks = 5
+    scale = 0.35
+    print(edge.shape)
+    vector_paths = extract_contours(edge, scale=scale, translate=margin, epsilon_factor=0.0001)
+    coorners = extract_coorners(edge, scale=scale, translate=margin)
+
+    # add intermediate points between coorners 
+    p1 = coorners[0]
+    p2 = coorners[1]
+    p3 = coorners[2]
+    p4 = coorners[3]
+    inter_num = 5
+    for i in range(1, inter_num):
+        coorners.append( (p1[0]+(p2[0]-p1[0])*i/inter_num, p1[1]+(p2[1]-p1[1])*i/inter_num) )
+        coorners.append( (p3[0]+(p4[0]-p3[0])*i/inter_num, p3[1]+(p4[1]-p3[1])*i/inter_num) )
+        coorners.append( (p1[0]+(p3[0]-p1[0])*i/inter_num, p1[1]+(p3[1]-p1[1])*i/inter_num) )
+        coorners.append( (p2[0]+(p4[0]-p2[0])*i/inter_num, p2[1]+(p4[1]-p2[1])*i/inter_num) )
+
+
+    axi = AxiSurface(size='12in x 16in')
+
+    for coorner in coorners:
+        axi.circle( center=coorner, radius=marks*0.5)
+        axi.line( [coorner[0]-marks, coorner[1]], [coorner[0]+marks, coorner[1]])
+        axi.line( [coorner[0], coorner[1]-marks], [coorner[0], coorner[1]+marks])
+
+    axi.path( Path(vector_paths).getSimplify(2.0).getSorted())
+
+    axi.toSVG(output_svg_path)
+    
+    torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
-    # os.system(" ".join(command))
     args = parse_args()
-    run_TEED(   checkpoint_path=args.checkpoint_data,
-                input_dir=args.input_dir,
-                output_dir=args.output_dir,
+    
+    if os.path.isdir(args.input):
+        os.makedirs(args.output, exist_ok=True)
+        for filename in os.listdir(args.input):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
+                input_image_path = os.path.join(args.input, filename)
+                output_image_path = os.path.join(args.output, os.path.splitext(filename)[0] + '.png')
+                run_TEED(input_image_path=input_image_path,
+                         output_image_path=output_image_path,
+                         img_size=(args.img_width, args.img_height),
+                         up_scale=args.up_scale,
+                         mean_bgr=args.mean)
+    else:
+        run_TEED(input_image_path=args.input,
+                output_image_path=args.output,
                 img_size=(args.img_width, args.img_height),
                 up_scale=args.up_scale,
-                mean_test=args.mean_test)
+                mean_bgr=args.mean)

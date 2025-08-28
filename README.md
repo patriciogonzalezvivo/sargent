@@ -1,5 +1,3 @@
-
-
 # Install 
 
 1. Create a new conda environment and activate it.
@@ -20,6 +18,14 @@ pip install -r requirements.txt
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -e .
 ```
+
+# Aknowladges
+
+This repository combines different models
+
+* [VGGT](https://github.com/facebookresearch/vggt) under [dedicated VGGT License](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt)
+* [RGBX](https://github.com/zheng95z/rgbx/tree/main) under [Adobe Research License](https://github.com/zheng95z/rgbx/blob/main/LICENSE)
+* [TEED](https://github.com/xavysp/TEED/tree/main) under [MIT License](https://github.com/xavysp/TEED/blob/main/LICENSE)
 
 
 

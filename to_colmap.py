@@ -35,7 +35,7 @@ from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="VGGT Demo")
+    parser = argparse.ArgumentParser(description="Run VGGT with a COLMAP scene bundle conversion")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
