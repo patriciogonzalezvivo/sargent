@@ -1,8 +1,3 @@
-"""
-Hello, welcome on board,
-"""
-from __future__ import print_function
-
 import argparse
 import os
 import numpy as np

@@ -3,10 +3,10 @@ import numpy as np
 import cv2
 
 import mediapipe as mp
-from mediapipe import solutions
-from mediapipe.framework.formats import landmark_pb2
+# from mediapipe import solutions
+# from mediapipe.framework.formats import landmark_pb2
 
-# from face_geometry import get_metric_landmarks, PCF, procrustes_landmark_basis
+from .face_geometry import get_metric_landmarks, PCF, procrustes_landmark_basis, canonical_uvs, canonical_indices
 
 # import pyvista as pv
 
@@ -71,102 +71,115 @@ from mediapipe.framework.formats import landmark_pb2
 #     return annotated_image
 
 
-# class NoFacesFoundException(Exception):
-#     pass
+def nodes_faces_edges() -> tuple [np.ndarray, np.ndarray]:
+
+    def edges2faces(edges: np.array):
+        """Construct properly oriented faces from the list of edges"""
+        faces = []
+        cycles = []
+
+        for i, (u1, v1) in enumerate(edges):
+            mask = edges[:, 0] == v1
+
+            next_idx = np.argwhere(mask).flatten()
+            next_edges = edges[mask]
+
+            for j, (u2, v2) in zip(next_idx, next_edges):
+                mask = (edges[:, 0] == v2) & (edges[:, 1] == u1)
+
+                if mask.sum() == 1:
+                    last_idx = np.argwhere(mask).item()
+
+                    if {i, j, last_idx} not in cycles:
+                        faces.append((u1, v1, v2))
+                        cycles.append({i, j, last_idx})
+
+        return np.array(faces)
+
+    edges = np.array(list(mp.solutions.face_mesh.FACEMESH_TESSELATION))
+    faces = edges2faces(edges)
+
+    edges = np.c_[2 * np.ones(len(edges))[:, None], edges].flatten().astype(int)
+    faces = np.c_[3 * np.ones(len(faces))[:, None], faces].flatten().astype(int)
+
+    faces = faces.reshape(-1, 4)[:, 1:4]
+
+    return faces, edges
+
+def nodes_faces() -> np.ndarray:
+    return np.array(canonical_indices)
 
 
-# def face2mesh(face_img: np.ndarray) -> Tuple[pv.PolyData, np.ndarray]:
+def nodes_uvs() -> np.ndarray:
+    return np.array(canonical_uvs)
 
 
-#     points_idx = [33,263,61,291,199]
-#     points_idx = points_idx + [key for (key,val) in procrustes_landmark_basis]
-#     points_idx = list(set(points_idx))
-#     points_idx.sort()
+def image_to_nodes(face_img: np.ndarray):
+    points_idx = [33,263,61,291,199]
+    points_idx = points_idx + [key for (key,val) in procrustes_landmark_basis]
+    points_idx = list(set(points_idx))
+    points_idx.sort()
 
-#     frame_height, frame_width, _ = face_img.shape
-#     focal_length = frame_width
-#     center = (frame_width/2, frame_height/2)
-#     camera_matrix = np.array(
-#                             [[focal_length, 0, center[0]],
-#                             [0, focal_length, center[1]],
-#                             [0, 0, 1]], dtype = "double"
-#                             )
+    frame_height, frame_width, _ = face_img.shape
+    focal_length = frame_width
+    center = (frame_width/2, frame_height/2)
+    camera_matrix = np.array(
+                            [[focal_length, 0, center[0]],
+                            [0, focal_length, center[1]],
+                            [0, 0, 1]], dtype = "double"
+                            )
 
-#     pcf = PCF(near=1,far=10000,frame_height=frame_height,frame_width=frame_width,fy=camera_matrix[1,1])
-#     dist_coeff = np.zeros((4, 1))
+    pcf = PCF(near=1,far=10000,frame_height=frame_height,frame_width=frame_width,fy=camera_matrix[1,1])
+    dist_coeff = np.zeros((4, 1))
 
-#     with mp.solutions.face_mesh.FaceMesh( 
-#         static_image_mode=True, 
-#         max_num_faces=1, 
-#         refine_landmarks=True, 
-#         min_detection_confidence=0.5, 
-#         # output_facial_transformation_matrixes=True,
-#         ) as face_mesh:
-#         results = face_mesh.process(face_img)
+    with mp.solutions.face_mesh.FaceMesh( 
+        static_image_mode=True, 
+        max_num_faces=1, 
+        refine_landmarks=True, 
+        min_detection_confidence=0.5, 
+        # output_facial_transformation_matrixes=True,
+        ) as face_mesh:
+        results = face_mesh.process(face_img)
 
-#         if not results.multi_face_landmarks:
-#             raise NoFacesFoundException()
+        if not results.multi_face_landmarks:
+            return None
         
-#         [face_landmarks] = results.multi_face_landmarks
+        [face_landmarks] = results.multi_face_landmarks
 
-#     preview: np.ndarray = generate_preview(landmarks=face_landmarks, face_img=face_img)
-#     nodes = np.stack(
-#         [[landmark.x, landmark.y, landmark.z] for landmark in face_landmarks.landmark]
-#     )
+    # print(face_landmarks)
 
-#     landmarks = np.array([(lm.x,lm.y,lm.z) for lm in face_landmarks.landmark])
-#     landmarks = landmarks.T
-#     metric_landmarks, pose_transform_mat = get_metric_landmarks(landmarks.copy(), pcf)
-#     model_points = metric_landmarks[0:3, points_idx].T
-#     image_points = landmarks[0:2, points_idx].T * np.array([frame_width, frame_height])[None,:]
+    # preview: np.ndarray = generate_preview(landmarks=face_landmarks, face_img=face_img)
+    nodes = np.stack(
+        [[landmark.x, landmark.y, landmark.z] for landmark in face_landmarks.landmark]
+    )
 
-#     success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeff, flags=cv2.cv2.SOLVEPNP_ITERATIVE)
-#     # _, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(model_points, image_points, camera_matrix, dist_coeff)
-#     (nose_end_point2D, jacobian) = cv2.projectPoints(np.array([(0.0, 0.0, 25.0)]), rotation_vector, translation_vector, camera_matrix, dist_coeff)
+    # landmarks = np.array([(lm.x,lm.y,lm.z) for lm in face_landmarks.landmark])
+    # landmarks = landmarks.T
+    # metric_landmarks, pose_transform_mat = get_metric_landmarks(landmarks.copy(), pcf)
+    # model_points = metric_landmarks[0:3, points_idx].T
+    # image_points = landmarks[0:2, points_idx].T * np.array([frame_width, frame_height])[None,:]
 
-#     print("Rotation Vector:\n {0}".format(rotation_vector))
-#     print("Translation Vector:\n {0}".format(translation_vector))
-#     print("Nose End Point:\n {0}".format(nose_end_point2D))
-#     print("Pose Transform Matrix:\n {0}".format(pose_transform_mat))
-#     print("Camera Matrix:\n {0}".format(camera_matrix))
-#     print("Distortion Coefficients:\n {0}".format(dist_coeff))
+    # success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeff, flags=cv2.cv2.SOLVEPNP_ITERATIVE)
+    # # _, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(model_points, image_points, camera_matrix, dist_coeff)
+    # (nose_end_point2D, jacobian) = cv2.projectPoints(np.array([(0.0, 0.0, 25.0)]), rotation_vector, translation_vector, camera_matrix, dist_coeff)
 
-#     def edges2faces(edges: np.array):
-#         """Construct properly oriented faces from the list of edges"""
-#         faces = []
-#         cycles = []
+    # print("Rotation Vector:\n {0}".format(rotation_vector))
+    # print("Translation Vector:\n {0}".format(translation_vector))
+    # print("Nose End Point:\n {0}".format(nose_end_point2D))
+    # print("Pose Transform Matrix:\n {0}".format(pose_transform_mat))
+    # print("Camera Matrix:\n {0}".format(camera_matrix))
+    # print("Distortion Coefficients:\n {0}".format(dist_coeff))
 
-#         for i, (u1, v1) in enumerate(edges):
-#             mask = edges[:, 0] == v1
+    # faces, edges = getFacesAndEdges()
+    # poly = pv.PolyData(nodes, faces=faces, lines=edges)
+    return nodes
 
-#             next_idx = np.argwhere(mask).flatten()
-#             next_edges = edges[mask]
-
-#             for j, (u2, v2) in zip(next_idx, next_edges):
-#                 mask = (edges[:, 0] == v2) & (edges[:, 1] == u1)
-
-#                 if mask.sum() == 1:
-#                     last_idx = np.argwhere(mask).item()
-
-#                     if {i, j, last_idx} not in cycles:
-#                         faces.append((u1, v1, v2))
-#                         cycles.append({i, j, last_idx})
-
-#         return np.array(faces)
-
-#     edges = np.array(list(mp.solutions.face_mesh.FACEMESH_TESSELATION))
-#     faces = edges2faces(edges)
-
-#     edges = np.c_[2 * np.ones(len(edges))[:, None], edges].flatten().astype(int)
-#     faces = np.c_[3 * np.ones(len(faces))[:, None], faces].flatten().astype(int)
-
-#     poly = pv.PolyData(nodes, faces=faces, lines=edges)
-#     return poly, preview
 
 def extract_points(landmarks, indexes, translate=(0,0), scale=(1.0, 1.0)) -> np.ndarray:
     points = np.array([landmarks.landmark[i] for i in indexes])
     points = np.array([[p.x * scale[0] + translate[0], p.y * scale[1] + translate[1]] for p in points])
     return points.astype(np.float32)
+
 
 def image_to_guidelines(image: np.ndarray, translate: tuple = (0, 0), scale: tuple = (1.0, 1.0)) -> np.ndarray:
     with mp.solutions.face_mesh.FaceMesh( 

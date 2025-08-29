@@ -9,19 +9,16 @@ import numpy as np
 import glob
 import os
 import copy
+
+import argparse
+
 import torch
 import torch.nn.functional as F
-
-import PIL.Image as pil_image
 
 # Configure CUDA settings
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-
-import argparse
-import trimesh
-
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
@@ -30,6 +27,11 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 
+import trimesh
+import PIL.Image as pil_image
+import cv2
+from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs
+import pyvista as pv
 # Set device and dtype
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,45 +41,73 @@ def parse_args():
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
-        "--conf_thres_value", type=float, default=2.5, help="Confidence threshold value for depth filtering (wo BA)"
+        "--confidence_threshold", type=float, default=1.25, help="Confidence threshold value for depth filtering"
     )
     return parser.parse_args()
 
 
-def run_VGGT(images, fixed_resolution: int = None):
-    # images: [B, 3, H, W]
+def run_VGGT(images, fixed_resolution: int = None, predictions_file: str = None):
 
-    assert len(images.shape) == 4
-    assert images.shape[1] == 3
+    if predictions_file and os.path.exists(predictions_file):
+        print(f"predictions.npz already exists, loading...")
+        predictions = np.load(predictions_file)
+        extrinsic = predictions["extrinsic"]
+        intrinsic = predictions["intrinsic"]
+        depth_map = predictions["depth_map"]
+        depth_conf = predictions["depth_conf"]
+        return extrinsic, intrinsic, depth_map, depth_conf
+    
+    else:
+            
+        # Input checks:
+        # Ensure the input is a 4D tensor with shape [B, 3, H, W]
+        assert len(images.shape) == 4
+        assert images.shape[1] == 3
 
-     # Run VGGT for camera and depth estimation
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
-    model.eval()
-    model = model.to(device)
+        # Run VGGT for camera and depth estimation
+        model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        model.eval()
+        model = model.to(device)
 
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-    # hard-coded to use 518 for VGGT
-    images = F.interpolate(images, size=(fixed_resolution, fixed_resolution), mode="bilinear", align_corners=False)
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            images = images[None]  # add batch dimension
-            aggregated_tokens_list, ps_idx = model.aggregator(images)
+        # hard-coded to use 518 for VGGT
+        images = F.interpolate(images, size=(fixed_resolution, fixed_resolution), mode="bilinear", align_corners=False)
 
-        # Predict Cameras
-        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=dtype):
+                images = images[None]  # add batch dimension
+                aggregated_tokens_list, ps_idx = model.aggregator(images)
 
-        # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            # Predict Cameras
+            pose_enc = model.camera_head(aggregated_tokens_list)[-1]
 
-        # Predict Depth Maps
-        depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+            # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
 
-    extrinsic = extrinsic.squeeze(0).cpu().numpy()
-    intrinsic = intrinsic.squeeze(0).cpu().numpy()
-    depth_map = depth_map.squeeze(0).cpu().numpy()
-    depth_conf = depth_conf.squeeze(0).cpu().numpy()
-    return extrinsic, intrinsic, depth_map, depth_conf
+            # Predict Depth Maps
+            depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+
+            # # Predict Point Maps
+            # point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx)
+
+        extrinsic = extrinsic.squeeze(0).cpu().numpy()
+        intrinsic = intrinsic.squeeze(0).cpu().numpy()
+        depth_map = depth_map.squeeze(0).cpu().numpy()
+        depth_conf = depth_conf.squeeze(0).cpu().numpy()
+
+        # Save predicions to numpy files
+        if predictions_file:
+            predictions = {
+                "extrinsic": extrinsic,
+                "intrinsic": intrinsic,
+                "depth_map": depth_map,
+                "depth_conf": depth_conf
+            }
+            np.savez_compressed(predictions_file, **predictions)
+            print(f"Saved predictions to {predictions_file}")
+
+        return extrinsic, intrinsic, depth_map, depth_conf
 
 
 def get_image_path_list(scene_dir):
@@ -89,55 +119,75 @@ def get_image_path_list(scene_dir):
     return image_path_list
 
 
-def to_Colmap(scene_dir, conf_thres_value):
-
+def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolution: int = 518, img_load_resolution: int = 1024, max_points_for_colmap: int = 100000):
     image_path_list = get_image_path_list(scene_dir)
 
-    # Load images and original coordinates
-    # Load Image in 1024, while running VGGT with 518
-    vggt_fixed_resolution = 518
-    img_load_resolution = 1024
-
+    # Load images as 1024x1024 square images, while preserving original coordinates
     images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
     images = images.to(device)
     original_coords = original_coords.to(device)
 
-    # Run VGGT to estimate camera and depth
-    # Run with 518x518 images
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(images, vggt_fixed_resolution)
+    predictions_file = os.path.join(scene_dir, "predictions.npz")
+    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(images, vggt_fixed_resolution, predictions_file)
+
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
     # Save to COLMAP format
-    max_points_for_colmap = 100000  # randomly sample 3D points
     image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
     num_frames, height, width, _ = points_3d.shape
+    print(f"Number of images: {num_frames}, Image size: {width}x{height}")
 
-    points_rgb = F.interpolate(
-        images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
-    )
+    # 3D points are in 518x518 resolution, so scale rgb accordingly and get rgb values
+    points_rgb = F.interpolate(images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False)
     points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
     points_rgb = points_rgb.transpose(0, 2, 3, 1)
 
     # (S, H, W, 3), with x, y coordinates and frame indices
     points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
-    conf_mask = depth_conf >= conf_thres_value
+    conf_mask = depth_conf >= confidence_threshold
     conf_mask_original = conf_mask.copy()
-    print(conf_mask.shape, "is the shape of confidence mask")
+
     # at most writing 100000 3d points to colmap reconstruction object
     conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-    print(conf_mask.sum(), "3D points are kept after confidence filtering")
 
     # get depth min and max after confidence filtering
     depth_values = depth_map[conf_mask]
     min_depth = float(depth_values.min())
     max_depth = float(depth_values.max())
 
+    min_confidence = float(depth_conf[conf_mask].min())
+    max_confidence = float(depth_conf[conf_mask].max())
+    print(f"Depth range: {min_depth:.4f} - {max_depth:.4f}")
+    print(f"Confidence range: {min_confidence:.4f} - {max_confidence:.4f}")
+
     # Export depth map images
     depth_dir = os.path.join(scene_dir, "depth")
     os.makedirs(depth_dir, exist_ok=True)
+
+    confidence_dir = os.path.join(scene_dir, "confidence")
+    os.makedirs(confidence_dir, exist_ok=True)
+
+    mask_dir = os.path.join(scene_dir, "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    faces = nodes_faces()
+    uvs = nodes_uvs()
+
+    # mesh = trimesh.Trimesh(vertices=nodes, faces=faces_ids, process=True)
+    # # mesh.visual.uv = uvs
+    # # mesh.visual.face_colors = [200, 200, 200, 255]
+    # mesh.export(os.path.join(scene_dir, "mesh.ply"))
+
     for i, depth in enumerate(depth_map):
+        image_path = image_path_list[i]
+
+        # img = cv2.cvtColor(cv2.imread(image_path_list[0]), cv2.COLOR_BGR2RGB) 
+        # points = image_to_nodes(img)
+        # if points:
+        #     print(f"Saving mesh for image {i} to {mask_dir}")
+        #     mesh = trimesh.Trimesh(vertices=points, faces=faces, uvs=uvs, process=False)
+        #     mesh_path = os.path.join(mask_dir, f"mesh_{i}.ply")
+        #     mesh.export(mesh_path, binary=False)
 
         # filter depth with confidence mask
         depth = depth.copy()
@@ -165,10 +215,24 @@ def to_Colmap(scene_dir, conf_thres_value):
         depth_img = np.repeat(depth_img, 3, axis=-1)
         depth_img = pil_image.fromarray(depth_img)
 
-        basename = os.path.basename(image_path_list[i])
+        basename = os.path.basename(image_path)
         basename = os.path.splitext(basename)[0]
         depth_img.save(os.path.join(depth_dir, f"{basename}.png"))
 
+        # save confidence map
+        confidence = depth_conf[i].copy()
+        confidence = np.rot90(confidence, k=3)  # rotate to match original orientation
+        confidence = confidence[pad_h: pad_h + int(orig_h * scale_factor), pad_w: pad_w + int(orig_w * scale_factor)]
+        confidence_img = (confidence - min_confidence) / (max_confidence - min_confidence)
+        confidence_img = np.clip(confidence_img, 0.0, 1.0)
+        confidence_img = (confidence_img * 255.0).astype(np.uint8)
+        confidence_img = np.repeat(confidence_img, 3, axis=-1)
+        # resize confidence to original image size
+        confidence_img = cv2.resize(confidence_img, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        confidence_img = pil_image.fromarray(confidence_img)
+        confidence_img.save(os.path.join(confidence_dir, f"{basename}.png"))
+
+    # filter points
     points_3d = points_3d[conf_mask]
     points_xyf = points_xyf[conf_mask]
     points_rgb = points_rgb[conf_mask]
@@ -253,7 +317,7 @@ if __name__ == "__main__":
             torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
         print(f"Setting seed as: {args.seed}")
 
-        to_Colmap(args.scene_dir, args.conf_thres_value)
+        to_colmap(args.scene_dir, args.confidence_threshold)
 
 
 # Work in Progress (WIP)

@@ -2,11 +2,18 @@
 
 1. Create a new conda environment and activate it.
 
-```
+```bash
 conda create -n sargent python=3.11 cmake=3.14.0
 conda activate sargent
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
-pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+
+# Install PyTorch with CUDA support (choose ONE of these methods)
+# Method 1: Using conda (recommended)
+conda install pytorch=2.3.1 torchvision=0.18.1 torchaudio=2.3.1 pytorch-cuda=12.1 -c pytorch -c nvidia
+
+# Method 2: Using pip (alternative)
+# pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
+
+# Install other requirements
 pip install -r requirements.txt
 ```
 

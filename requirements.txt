@@ -1,7 +1,5 @@
-diffusers
 torch==2.3.1
 torchvision==0.18.1
-torchaudio
 transformers>=4.40.1
 opencv-python>=4.5.0
 numpy>=1.26.4
@@ -10,3 +8,7 @@ Pillow
 einops
 safetensors
 mediapipe
+scikit-image
+Shapely
+trimesh
+pycolmap==3.10.0
