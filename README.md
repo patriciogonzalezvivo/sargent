@@ -15,6 +15,7 @@ conda install pytorch=2.3.1 torchvision=0.18.1 torchaudio=2.3.1 pytorch-cuda=12.
 
 # Install other requirements
 pip install -r requirements.txt
+pip install git+https://github.com/microsoft/MoGe.git
 ```
 
 2. Install [VGGT](https://github.com/facebookresearch/vggt) and its dependencies as a python package.
@@ -32,6 +33,6 @@ This repository combines different models
 * [VGGT](https://github.com/facebookresearch/vggt) under [dedicated VGGT License](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt)
 * [TEED](https://github.com/xavysp/TEED/tree/main) under [MIT License](https://github.com/xavysp/TEED/blob/main/LICENSE)
 * [Mediapipe](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) under [Apache License 2.0](https://github.com/google/mediapipe/blob/main/LICENSE)
-
+* [MoGeV2](https://github.com/microsoft/MoGe) under [MIT License](https://github.com/microsoft/MoGe/blob/main/LICENSE)
 
 
