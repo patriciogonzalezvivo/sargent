@@ -5,10 +5,9 @@ os.environ['CUDA_LAUNCH_BLOCKING']="0"
 
 import cv2
 import torch
-from torch.utils.data import Dataset, DataLoader
 
 # TEED (Tiny Edge-Enhancement Distillation) model
-from ted import TED
+from utils.ted import TED
 device = torch.device('cpu' if torch.cuda.device_count() == 0 else 'cuda')
 checkpoint_path = 'checkpoints/teed.pth'
 model = None

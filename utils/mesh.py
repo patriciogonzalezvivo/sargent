@@ -222,6 +222,7 @@ class Mesh:
 
         self.offset = 0
 
+
     def invertNormals( self ):
         # tig: flip face(=triangle) winding order, so that we are consistent with all other ofPrimitives.
         # i wish there was a more elegant way to do this, but anything happening before 'split vertices'
@@ -233,6 +234,7 @@ class Mesh:
 
         for i in range(0, len(self.vertices_normals)):
             self.vertices_normals[i] = np.array(self.vertices_normals[i]) * -1.
+
 
     def flatNormals( self ):
         # get copy original mesh data
@@ -272,6 +274,72 @@ class Mesh:
             if indexCurr < len(colors):
                 self.addColor(colors[indexCurr])
 
+
+    def smoothNormals( self ):
+        """Calculate smooth vertex normals by averaging adjacent face normals."""
+        if len(self.vertices) == 0 or len(self.indices) == 0:
+            return
+            
+        # Clear existing normals
+        self.vertices_normals = []
+        
+        # Initialize normal accumulator for each vertex
+        vertex_normals = [np.zeros(3) for _ in range(len(self.vertices))]
+        vertex_counts = [0 for _ in range(len(self.vertices))]
+        
+        # Calculate face normals and accumulate at vertices
+        for i in range(0, len(self.indices), 3):
+            # Get triangle vertex indices
+            i0 = self.indices[i]
+            i1 = self.indices[i + 1] 
+            i2 = self.indices[i + 2]
+            
+            # Get vertex positions
+            v0 = self.vertices[i0]
+            v1 = self.vertices[i1]
+            v2 = self.vertices[i2]
+            
+            # Calculate face normal using cross product
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            face_normal = np.cross(edge1, edge2)
+            
+            # Normalize the face normal
+            length = np.linalg.norm(face_normal)
+            if length > 1e-12:  # Avoid division by zero
+                face_normal = face_normal / length
+            else:
+                face_normal = np.array([0.0, 0.0, 1.0])  # Default normal
+            
+            # Accumulate normal at each vertex of the triangle
+            vertex_normals[i0] += face_normal
+            vertex_normals[i1] += face_normal
+            vertex_normals[i2] += face_normal
+            
+            vertex_counts[i0] += 1
+            vertex_counts[i1] += 1
+            vertex_counts[i2] += 1
+        
+        # Average and normalize the accumulated normals
+        for i in range(len(self.vertices)):
+            if vertex_counts[i] > 0:
+                # Average the accumulated normals
+                avg_normal = vertex_normals[i] / vertex_counts[i]
+                
+                # Normalize the averaged normal
+                length = np.linalg.norm(avg_normal)
+                if length > 1e-12:
+                    avg_normal = avg_normal / length
+                else:
+                    avg_normal = np.array([0.0, 0.0, 1.0])  # Default normal
+                    
+                self.addNormal(avg_normal)
+            else:
+                # Vertex not used in any face, add default normal
+                self.addNormal(np.array([0.0, 0.0, 1.0]))
+        
+        # Update normal indices to match vertex indices
+        self.indices_normals = self.indices.copy()
 
     def scale( self, scale ):
         mat = mat4_scale(scale)

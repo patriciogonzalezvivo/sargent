@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.AF.Fsmish import smish as Fsmish
-from utils.AF.Xsmish import Smish
+from .AF.Fsmish import smish as Fsmish
+from .AF.Xsmish import Smish
 
 
 def weight_init(m):

@@ -30,7 +30,7 @@ from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 from utils.mesh import Mesh
 import PIL.Image as pil_image
 import cv2
-from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs
+from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs, unwarp_texture
 
 # Set device and dtype
 
@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--confidence_threshold", type=float, default=1.25, help="Confidence threshold value for depth filtering")
     parser.add_argument("--export_depth", action="store_true", default=False, help="Whether to export depth maps")
+    parser.add_argument("--export_mask_texture", action="store_true", default=False, help="Whether to export mask texture maps")
     return parser.parse_args()
 
 
@@ -238,11 +239,18 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
             mask_nodes_colors = points_rgb[i][v_coords, u_coords]
             agregate_masks_node_colors.append(mask_nodes_colors)
 
+            if args.export_mask_texture:
+                # Export texture map for the mask
+                texture = unwarp_texture(img, mask_nodes)
+                texture_path = os.path.splitext(mask_obj_path)[0] + '_texture.png'
+                cv2.imwrite(texture_path, cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+
             mask = Mesh()
             mask.addVertices(mask_nodes_world)
             mask.addTexCoords(uvs)
             mask.addTriangles(faces)
             mask.addColors(mask_nodes_colors)
+            mask.smoothNormals()
             mask.toObj(mask_obj_path)
 
             # Get confidence values at face landmark positions
@@ -355,6 +363,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
         agregated_mask_mesh.addTriangles(faces_filtered)
         agregated_mask_mesh.addColors(filtered_mask_colors)
         # agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
+        agregated_mask_mesh.smoothNormals()
         agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
 
 
