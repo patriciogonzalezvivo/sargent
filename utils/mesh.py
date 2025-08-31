@@ -2,34 +2,10 @@ import os
 import numpy as np
 from math import sqrt
 from .matrix import *
+from .boundingbox import boundingBox
 
-def boundingBox(points):
-    min_x, min_y, min_z = float("inf"), float("inf"), float("inf")
-    max_x, max_y,max_z = float("-inf"), float("-inf"), float("-inf")
-    for point in points:
-        if point[0] < min_x:
-            min_x = point[0]
-        if point[1] < min_y:
-            min_y = point[1]
 
-        if point[0] > max_x:
-            max_x = point[0]
-        if point[1] > max_y:
-            max_y = point[1]
-
-        if len(point) == 3:
-            if point[2] < min_z:
-                min_z = point[2]
-            if point[2] > max_z:
-                max_z = point[2]
-    
-    if len(point) == 3:
-        return min_x, min_y, min_z, max_x, max_y, max_z
-    else:
-        return min_x, min_y, max_x, max_y
-    
-
-class Mesh(object):
+class Mesh:
     def __init__(self, name = ''):
         self.name = name
         self.vertices = []
@@ -75,7 +51,7 @@ class Mesh(object):
         return len(self.vertices)
 
     def vertexString( self, index ):
-        return '%f %f %f' % (self.vertices[index][0], self.vertices[index][1], self.vertices[index][2])
+        return f'{self.vertices[index][0]:f} {self.vertices[index][1]:f} {self.vertices[index][2]:f}'
 
     # TEXCOORDS
 
@@ -98,7 +74,7 @@ class Mesh(object):
         self.addTexCoordIndex( i3 )
 
     def texCoordString( self, index ):
-        return ' %f %f' % (self.vertices_texcoords[index][0], self.vertices_texcoords[index][1])
+        return f' {self.vertices_texcoords[index][0]:f} {self.vertices_texcoords[index][1]:f}'
 
     # NORMALS
 
@@ -118,12 +94,12 @@ class Mesh(object):
 
     def normalString( self, index):
         n = self.vertices_normals[index]
-        return ' %f %f %f' % (n[0], n[1], n[2])
+        return f' {n[0]:f} {n[1]:f} {n[2]:f}'
 
     # COLORS
 
     def addColor( self, vc ):
-        if isinstance(vc, basestring) or isinstance(vc, str):
+        if isinstance(vc, str):
             vc = vc.lstrip('#')
             lv = len(vc)
             color = tuple(int(vc[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
@@ -133,14 +109,18 @@ class Mesh(object):
         else:
             self.vertices_colors.append( np.array(vc) )
 
+    def addColors( self, colors ):
+        for vc in colors:
+            self.addColor(vc)
+
     def colorString( self, index, alpha = True ):
         if len(self.vertices_colors[index]) == 3:
-            return ' %i %i %i' % (self.vertices_colors[index][0], self.vertices_colors[index][1], self.vertices_colors[index][2])
+            return f' {self.vertices_colors[index][0]:d} {self.vertices_colors[index][1]:d} {self.vertices_colors[index][2]:d}'
         elif len(self.vertices_colors[index]) == 4:
             if alpha:
-                return ' %f %f %f %f' % (self.vertices_colors[index][0], self.vertices_colors[index][1], self.vertices_colors[index][2], self.vertices_colors[index][3])
+                return f' {self.vertices_colors[index][0]:f} {self.vertices_colors[index][1]:f} {self.vertices_colors[index][2]:f} {self.vertices_colors[index][3]:f}'
             else:
-                return ' %f %f %f' % (self.vertices_colors[index][0], self.vertices_colors[index][1], self.vertices_colors[index][2])
+                return f' {self.vertices_colors[index][0]:f} {self.vertices_colors[index][1]:f} {self.vertices_colors[index][2]:f}'
 
     # EDGES
 
@@ -221,7 +201,7 @@ class Mesh(object):
     #  MATERIAL
 
     def addMaterial( self, mat, index = None ):
-        if index == None:
+        if index is None:
             index = len(self.vertices)
         self.materials.append( [index, mat] )
 
@@ -396,19 +376,18 @@ class Mesh(object):
         lines = '# OBJ by Patricio Gonzalez Vivo\n'
 
         # Materials Library
-        if file_name != None and len(self.materials) > 0:
+        if file_name is not None and len(self.materials) > 0:
             mat_lines = ''
             mat_names = []
             for mat in self.materials:
                 name = mat[1].name
-                if not name in mat_names:
+                if name not in mat_names:
                     mat_names.append(name)
                     mat_lines += mat[1].toMtl()
 
             mat_filename = os.path.splitext(file_name)[0] + '.mtl'
-            file = open( mat_filename, 'w' )
-            file.write( mat_lines )
-            file.close()
+            with open(mat_filename, 'w') as file:
+                file.write(mat_lines)
             lines += 'mtllib ' + os.path.basename(mat_filename) + '\n'
 
         # Name
@@ -442,71 +421,71 @@ class Mesh(object):
             lines += 'f' + self.faceString( index ) + '\n'
 
         if file_name:
-            file = open(file_name, 'w')
-            file.write( lines )
-            file.close()
+            with open(file_name, 'w') as file:
+                file.write(lines)
         else:
             return lines
 
     def fromObj( self, file_name ):
-        for line in open(file_name, 'r'):
-            # Skip comments
-            if line.startswith('#'):
-                continue
+        with open(file_name, 'r') as f:
+            for line in f:
+                # Skip comments
+                if line.startswith('#'):
+                    continue
 
-            # Skip empty lines
-            if line == "":
-                continue
-            
-            values = line.split()
+                # Skip empty lines
+                if line == "":
+                    continue
+                
+                values = line.split()
 
-            # Skip if there is not enough information
-            if len(values) < 2:
-                continue
+                # Skip if there is not enough information
+                if len(values) < 2:
+                    continue
 
-            type = values[0]
-            args = values[1:]
+                type = values[0]
+                args = values[1:]
 
-            if type == 'v':
-                if len(args) == 3:
-                    v = map(float, args)
-                    self.addVertex(np.array(v))
-            elif type == 'vt':
-                if len(args) == 2:
-                    vt = map(float, args)
-                    self.addTexCoord(np.array(vt))
-            elif type == 'vn':
-                if len(args) == 3:
-                    vn = map(float, args)
-                    self.addNormal(np.array(vn))
-            elif type == 'f':
-                if len(args) == 3:
-                    A = map(int, args[0].split('/'))
-                    B = map(int, args[1].split('/'))
-                    C = map(int, args[2].split('/'))
+                if type == 'v':
+                    if len(args) == 3:
+                        v = list(map(float, args))
+                        self.addVertex(np.array(v))
+                elif type == 'vt':
+                    if len(args) == 2:
+                        vt = list(map(float, args))
+                        self.addTexCoord(np.array(vt))
+                elif type == 'vn':
+                    if len(args) == 3:
+                        vn = list(map(float, args))
+                        self.addNormal(np.array(vn))
+                elif type == 'f':
+                    if len(args) == 3:
+                        A = list(map(int, args[0].split('/')))
+                        B = list(map(int, args[1].split('/')))
+                        C = list(map(int, args[2].split('/')))
 
-                    self.addTriangle(A[0]-1, B[0]-1, C[0]-1)
+                        self.addTriangle(A[0]-1, B[0]-1, C[0]-1)
 
-                    # if (A[0] != A[1] != A[2]) or (B[0] != B[1] != B[2]) or (C[0] != C[1] != C[2]):
-                    self.addTexCoordTriangle(A[1]-1, B[1]-1, C[1]-1)
-                    self.addNormalTriangle(A[2]-1, B[2]-1, C[2]-1)
-                elif len(args) > 3:
-                    values = []
+                        # if (A[0] != A[1] != A[2]) or (B[0] != B[1] != B[2]) or (C[0] != C[1] != C[2]):
+                        self.addTexCoordTriangle(A[1]-1, B[1]-1, C[1]-1)
+                        self.addNormalTriangle(A[2]-1, B[2]-1, C[2]-1)
+                    elif len(args) > 3:
+                        values = []
 
-                    for i in range(len(args)):
-                        values.append( map(int, args[i].split('/')) )
+                        for i in range(len(args)):
+                            values.append( list(map(int, args[i].split('/'))) )
 
-                    # Add first triangle
-                    self.addTriangle(values[0][0]-1, values[1][0]-1, values[2][0]-1)
-                    # if (values[0][0] != values[0][1] != values[0][2]) or (values[1][0] != values[1][1] != values[1][2]) or (values[2][0] != values[2][1] != values[2][2]):
-                    self.addTexCoordTriangle(values[0][1]-1, values[1][1]-1, values[2][1]-1)
-                    self.addNormalTriangle(values[0][2]-1, values[1][2]-1, values[2][2]-1)
+                        # Add first triangle
+                        self.addTriangle(values[0][0]-1, values[1][0]-1, values[2][0]-1)
+                        # if (values[0][0] != values[0][1] != values[0][2]) or (values[1][0] != values[1][1] != values[1][2]) or (values[2][0] != values[2][1] != values[2][2]):
+                        self.addTexCoordTriangle(values[0][1]-1, values[1][1]-1, values[2][1]-1)
+                        self.addNormalTriangle(values[0][2]-1, values[1][2]-1, values[2][2]-1)
 
-                    for i in range(3, len(values)):
-                        self.addTriangle(values[i-3][0]-1, values[i-1][0]-1, values[i][0]-1)
-                        # if (values[i-3][0] != values[i-3][1] != values[i-3][2]) or (values[i-1][0] != values[i-1][1] != values[i-1][2]) or (values[i][0] != values[i][1] != values[i][2]):
-                        self.addTexCoordTriangle(values[i-3][1]-1, values[i-1][1]-1, values[i][1]-1)
-                        self.addNormalTriangle(values[i-3][2]-1, values[i-1][2]-1, values[i][2]-1)
+                        for i in range(3, len(values)):
+                            self.addTriangle(values[i-3][0]-1, values[i-1][0]-1, values[i][0]-1)
+                            # if (values[i-3][0] != values[i-3][1] != values[i-3][2]) or (values[i-1][0] != values[i-1][1] != values[i-1][2]) or (values[i][0] != values[i][1] != values[i][2]):
+                            self.addTexCoordTriangle(values[i-3][1]-1, values[i-1][1]-1, values[i][1]-1)
+                            self.addNormalTriangle(values[i-3][2]-1, values[i-1][2]-1, values[i][2]-1)
 
     def toPly( self, file_name = None ):
         lines = '''ply
@@ -519,7 +498,7 @@ property float z
         if len(self.vertices_normals) > 0:
             lines += 'property float nx\n'
             lines += 'property float ny\n'
-            lines += 'property float nx\n'
+            lines += 'property float nz\n'
 
         if len(self.vertices_colors) > 0:
             if len(self.vertices_colors[0]) == 3:
@@ -576,9 +555,8 @@ property float z
                 lines += self.edgeString(t) + '\n'
 
         if file_name:
-            file = open(file_name, 'w')
-            file.write( lines )
-            file.close()
+            with open(file_name, 'w') as file:
+                file.write(lines)
         else:
             return lines
 
@@ -610,176 +588,177 @@ property float z
 
         floatColor = False
 
-        for line in open(file_name, 'r'):
-            lineNum += 1
-            # get rid of the new line
-            line = line.rstrip()
-            # print(str(lineNum) + " " + line)
+        with open(file_name, 'r') as f:
+            for line in f:
+                lineNum += 1
+                # get rid of the new line
+                line = line.rstrip()
+                # print(str(lineNum) + " " + line)
 
-            if lineNum == 0:
-                if line != 'ply':
-                    print("wrong format, expecting 'ply'")
-                    return
-            elif lineNum == 1:
-                if line != "format ascii 1.0":
-                    print("wrong format, expecting 'format ascii 1.0'")
-                    return
-            
-            if 'comment' in line:
-                continue
-
-            # HEADER 
-            if (state==State.Header or state==State.FaceDef) and line.startswith('element vertex'):
-                state = State.VertexDef
-                orderVertices = max(orderIndices, 0)+1
-                expectedVertices = int(line[15:])
-                # print(state)
-                # print(line[15:])
-                continue;
-
-            if (state==State.Header or state==State.VertexDef) and line.startswith('element face'):
-                state = State.FaceDef
-                orderIndices = max(orderVertices, 0)+1
-                expectedFaces = int(line[13:])
-                # print(state)
-                # print(line[13:])
-                continue
-
-            # Vertex Def
-            if state==State.VertexDef:
-
-                if line.startswith('property float x') or line.startswith('property float y') or line.startswith('property float z'):
-                    vertexCoordsFound += 1
-                    # print('vertexCoordsFound ' + str(vertexCoordsFound))
+                if lineNum == 0:
+                    if line != 'ply':
+                        print("wrong format, expecting 'ply'")
+                        return
+                elif lineNum == 1:
+                    if line != "format ascii 1.0":
+                        print("wrong format, expecting 'format ascii 1.0'")
+                        return
+                
+                if 'comment' in line:
                     continue
 
-                if line.startswith('property float nx') or line.startswith('property float ny') or line.startswith('property float nz'):
-                    normalsCoordsFound += 1
-                    # print('normalsCoordsFound ' + str(normalsCoordsFound))
+                # HEADER 
+                if (state==State.Header or state==State.FaceDef) and line.startswith('element vertex'):
+                    state = State.VertexDef
+                    orderVertices = max(orderIndices, 0)+1
+                    expectedVertices = int(line[15:])
+                    # print(state)
+                    # print(line[15:])
                     continue
 
-                if line.startswith('property float r') or line.startswith('property float g') or line.startswith('property float b') or line.startswith('property float a'):
-                    colorCompsFound += 1
-                    # print('colorCompsFound ' + str(colorCompsFound))
-                    floatColor = True
-                    continue
-            
-                if line.startswith('property uchar red') or line.startswith('property uchar green') or line.startswith('property uchar blue') or line.startswith('property uchar alpha'):
-                    colorCompsFound += 1
-                    # print('colorCompsFound ' + str(colorCompsFound))
-                    floatColor = False
+                if (state==State.Header or state==State.VertexDef) and line.startswith('element face'):
+                    state = State.FaceDef
+                    orderIndices = max(orderVertices, 0)+1
+                    expectedFaces = int(line[13:])
+                    # print(state)
+                    # print(line[13:])
                     continue
 
-                if line.startswith('property float u') or line.startswith('property float v'):
-                    texCoordsFound += 1
-                    # print('texCoordsFound ' + str(texCoordsFound))
-                    continue
+                # Vertex Def
+                if state==State.VertexDef:
 
-                if line.startswith('property float texture_u') or line.startswith('property float texture_v'):
-                    texCoordsFound += 1
-                    # print('texCoordsFound ' + str(texCoordsFound))
-                    continue
+                    if line.startswith('property float x') or line.startswith('property float y') or line.startswith('property float z'):
+                        vertexCoordsFound += 1
+                        # print('vertexCoordsFound ' + str(vertexCoordsFound))
+                        continue
 
-            # if state==State.FaceDef and line.find('property list')!=0 and line!='end_header':
-            #     print('wrong face definition')
+                    if line.startswith('property float nx') or line.startswith('property float ny') or line.startswith('property float nz'):
+                        normalsCoordsFound += 1
+                        # print('normalsCoordsFound ' + str(normalsCoordsFound))
+                        continue
 
-            if line=='end_header':
-                # Check that all basic elements seams ok and healthy
-                if colorCompsFound > 0 and colorCompsFound < 3:
-                    print('data has color coordiantes but not correct number of components. Found ' + str(colorCompsFound) + ' expecting 3 or 4')
-                    return
+                    if line.startswith('property float r') or line.startswith('property float g') or line.startswith('property float b') or line.startswith('property float a'):
+                        colorCompsFound += 1
+                        # print('colorCompsFound ' + str(colorCompsFound))
+                        floatColor = True
+                        continue
+                
+                    if line.startswith('property uchar red') or line.startswith('property uchar green') or line.startswith('property uchar blue') or line.startswith('property uchar alpha'):
+                        colorCompsFound += 1
+                        # print('colorCompsFound ' + str(colorCompsFound))
+                        floatColor = False
+                        continue
 
-                if normalsCoordsFound != 3:
-                    print('data has normal coordiantes but not correct number of components. Found ' + str(normalsCoordsFound) + ' expecting 3')
-                    return
+                    if line.startswith('property float u') or line.startswith('property float v'):
+                        texCoordsFound += 1
+                        # print('texCoordsFound ' + str(texCoordsFound))
+                        continue
 
-                if expectedVertices == 0:
-                    print('mesh loaded has no vertices')
-                    return
+                    if line.startswith('property float texture_u') or line.startswith('property float texture_v'):
+                        texCoordsFound += 1
+                        # print('texCoordsFound ' + str(texCoordsFound))
+                        continue
 
-                if orderVertices == -1:
-                    orderVertices = 9999
-                if orderIndices == -1:
-                    orderIndices = 9999;
+                # if state==State.FaceDef and line.find('property list')!=0 and line!='end_header':
+                #     print('wrong face definition')
 
-                if orderVertices < orderIndices:
-                    state = State.Vertices
-                else:
-                    state = State.Faces
+                if line=='end_header':
+                    # Check that all basic elements seams ok and healthy
+                    if colorCompsFound > 0 and colorCompsFound < 3:
+                        print('data has color coordiantes but not correct number of components. Found ' + str(colorCompsFound) + ' expecting 3 or 4')
+                        return
 
-                continue
-            
-            if state == State.Vertices:
-                values = line.split()
+                    if normalsCoordsFound != 3:
+                        print('data has normal coordiantes but not correct number of components. Found ' + str(normalsCoordsFound) + ' expecting 3')
+                        return
 
-                # Extract vertex
-                v = [0.0, 0.0, 0.0]
-                v[0] = float(values.pop(0))
-                v[1] = float(values.pop(0))
-                if vertexCoordsFound > 2:
-                    v[2] = float(values.pop(0))
-                self.addVertex(np.array(v))
+                    if expectedVertices == 0:
+                        print('mesh loaded has no vertices')
+                        return
 
-                # Extract normal
-                if normalsCoordsFound > 0:
-                    n = [0.0, 0.0, 0.0]
-                    n[0] = float(values.pop(0))
-                    n[1] = float(values.pop(0))
-                    n[2] = float(values.pop(0))
-                    self.addNormal(np.array(n))
+                    if orderVertices == -1:
+                        orderVertices = 9999
+                    if orderIndices == -1:
+                        orderIndices = 9999
 
-                # Extract color
-                if colorCompsFound > 0:
-                    c = [1.0, 1.0, 1.0, 1.0]
-                    div = 255.0
-                    if floatColor:
-                        div = 1.0
-
-                    c[0] = float(values.pop(0))/div
-                    c[1] = float(values.pop(0))/div
-                    c[2] = float(values.pop(0))/div
-                    if colorCompsFound > 3:
-                        c[3] = float(values.pop(0))/div
-                    self.addColor(np.array(c))
-
-                # Extract UVs
-                if texCoordsFound > 0:
-                    uv = [0.0, 0.0]
-                    uv[0] = float(values.pop(0))
-                    uv[1] = float(values.pop(0))
-                    self.addTexCoord(np.array(uv))
-
-                if len(self.vertices) == expectedVertices:
                     if orderVertices < orderIndices:
-                        state = State.Faces
-                    else:
-                        state = State.Vertices
-                    continue
-
-            if state == State.Faces:
-                values = line.split()
-                numV = int(values.pop(0))
-
-                if numV != 3:
-                    print("face not a triangle")
-
-                for i in range(numV):
-                    index = int(values.pop(0))
-                    self.addIndex( index )
-                    if normalsCoordsFound:
-                        self.addNormalIndex(index)
-                    if texCoordsFound:
-                        self.addTexCoordIndex(index)
-
-                if currentFace == expectedFaces:
-                    print("finish w indices")
-                    if orderVertices<orderIndices:
                         state = State.Vertices
                     else:
                         state = State.Faces
-                    continue
 
-                currentFace += 1
+                    continue
+                
+                if state == State.Vertices:
+                    values = line.split()
+
+                    # Extract vertex
+                    v = [0.0, 0.0, 0.0]
+                    v[0] = float(values.pop(0))
+                    v[1] = float(values.pop(0))
+                    if vertexCoordsFound > 2:
+                        v[2] = float(values.pop(0))
+                    self.addVertex(np.array(v))
+
+                    # Extract normal
+                    if normalsCoordsFound > 0:
+                        n = [0.0, 0.0, 0.0]
+                        n[0] = float(values.pop(0))
+                        n[1] = float(values.pop(0))
+                        n[2] = float(values.pop(0))
+                        self.addNormal(np.array(n))
+
+                    # Extract color
+                    if colorCompsFound > 0:
+                        c = [1.0, 1.0, 1.0, 1.0]
+                        div = 255.0
+                        if floatColor:
+                            div = 1.0
+
+                        c[0] = float(values.pop(0))/div
+                        c[1] = float(values.pop(0))/div
+                        c[2] = float(values.pop(0))/div
+                        if colorCompsFound > 3:
+                            c[3] = float(values.pop(0))/div
+                        self.addColor(np.array(c))
+
+                    # Extract UVs
+                    if texCoordsFound > 0:
+                        uv = [0.0, 0.0]
+                        uv[0] = float(values.pop(0))
+                        uv[1] = float(values.pop(0))
+                        self.addTexCoord(np.array(uv))
+
+                    if len(self.vertices) == expectedVertices:
+                        if orderVertices < orderIndices:
+                            state = State.Faces
+                        else:
+                            state = State.Vertices
+                        continue
+
+                if state == State.Faces:
+                    values = line.split()
+                    numV = int(values.pop(0))
+
+                    if numV != 3:
+                        print("face not a triangle")
+
+                    for i in range(numV):
+                        index = int(values.pop(0))
+                        self.addIndex( index )
+                        if normalsCoordsFound:
+                            self.addNormalIndex(index)
+                        if texCoordsFound:
+                            self.addTexCoordIndex(index)
+
+                    if currentFace == expectedFaces:
+                        print("finish w indices")
+                        if orderVertices<orderIndices:
+                            state = State.Vertices
+                        else:
+                            state = State.Faces
+                        continue
+
+                    currentFace += 1
 
     def toBlenderMesh( self, blender_mesh ):
         edges = []
