@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 
 # Facetracker
-from utils.face_tracker import image_to_nodes, nodes_faces_edges, nodes_uvs, nodes_faces
+from utils.face_tracker import image_to_nodes, nodes_uvs, nodes_faces
 import trimesh
 
 

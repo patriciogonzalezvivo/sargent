@@ -28,10 +28,11 @@ from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 
 import trimesh
+from utils.mesh import Mesh
 import PIL.Image as pil_image
 import cv2
 from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs
-import pyvista as pv
+
 # Set device and dtype
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -40,9 +41,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run VGGT with a COLMAP scene bundle conversion")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument(
-        "--confidence_threshold", type=float, default=1.25, help="Confidence threshold value for depth filtering"
-    )
+    parser.add_argument("--confidence_threshold", type=float, default=1.25, help="Confidence threshold value for depth filtering")
+    parser.add_argument("--export_depth", action="store_true", default=False, help="Whether to export depth maps")
     return parser.parse_args()
 
 
@@ -156,81 +156,223 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     min_depth = float(depth_values.min())
     max_depth = float(depth_values.max())
 
-    min_confidence = float(depth_conf[conf_mask].min())
-    max_confidence = float(depth_conf[conf_mask].max())
+    min_depth_confidence = float(depth_conf[conf_mask_original].min())
+    max_depth_confidence = float(depth_conf[conf_mask_original].max())
     print(f"Depth range: {min_depth:.4f} - {max_depth:.4f}")
-    print(f"Confidence range: {min_confidence:.4f} - {max_confidence:.4f}")
+    print(f"Confidence range: {min_depth_confidence:.4f} - {max_depth_confidence:.4f}")
 
     # Export depth map images
-    depth_dir = os.path.join(scene_dir, "depth")
-    os.makedirs(depth_dir, exist_ok=True)
-
-    confidence_dir = os.path.join(scene_dir, "confidence")
-    os.makedirs(confidence_dir, exist_ok=True)
+    if args.export_depth:
+        depth_dir = os.path.join(scene_dir, "depth")
+        os.makedirs(depth_dir, exist_ok=True)
 
     mask_dir = os.path.join(scene_dir, "masks")
     os.makedirs(mask_dir, exist_ok=True)
     faces = nodes_faces()
     uvs = nodes_uvs()
 
-    # mesh = trimesh.Trimesh(vertices=nodes, faces=faces_ids, process=True)
-    # # mesh.visual.uv = uvs
-    # # mesh.visual.face_colors = [200, 200, 200, 255]
-    # mesh.export(os.path.join(scene_dir, "mesh.ply"))
+    agregate_masks_node_positions = []
+    agregate_masks_normalized_weights = []
 
     for i, depth in enumerate(depth_map):
         image_path = image_path_list[i]
 
-        # img = cv2.cvtColor(cv2.imread(image_path_list[0]), cv2.COLOR_BGR2RGB) 
-        # points = image_to_nodes(img)
-        # if points:
-        #     print(f"Saving mesh for image {i} to {mask_dir}")
-        #     mesh = trimesh.Trimesh(vertices=points, faces=faces, uvs=uvs, process=False)
-        #     mesh_path = os.path.join(mask_dir, f"mesh_{i}.ply")
-        #     mesh.export(mesh_path, binary=False)
-
-        # filter depth with confidence mask
-        depth = depth.copy()
-        depth[~conf_mask_original[i]] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
-
-        # rotate depth to original image size
-        depth = np.rot90(depth, k=3)  # rotate to match original orientation
-
         # place depth in original image size
         orig_h, orig_w = original_coords[i, -2:].cpu().numpy().astype(int)
 
-        # calculate the scale factor used to resize original image to square image
-        scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
-        # calculate the padding added to the original image to make it square
-        # after resizing, the padding should also be scaled
-        pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
-        pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+        img = cv2.cvtColor(cv2.imread(image_path_list[i]), cv2.COLOR_BGR2RGB) 
+        mask_nodes = image_to_nodes(img)
+        if mask_nodes is not None:
+            mask_obj_path = os.path.join(mask_dir, f"{os.path.basename(image_path_list[i]).split('.')[0]}.obj")
+            mask_ply_path = os.path.join(mask_dir, f"{os.path.basename(image_path_list[i]).split('.')[0]}.ply")
 
-        depth = depth[pad_h: pad_h + int(orig_h * scale_factor), pad_w: pad_w + int(orig_w * scale_factor)]
+            # Get original image dimensions for coordinate transformation
+            top_left = original_coords[i, :2].cpu().numpy()  # padding offset in processed image
+            scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)  # scale used to resize to 518x518
+            
+            # Convert normalized MediaPipe coordinates to VGGT image coordinates (518x518)
+            # MediaPipe x,y are normalized [0,1], so scale to image dimensions
+            mask_nodes_image = mask_nodes.copy()
+            mask_nodes_image[:, 0] *= orig_w * scale_factor  # scale x to resized image width
+            mask_nodes_image[:, 1] *= orig_h * scale_factor  # scale y to resized image height
+            
+            # Add padding offset to account for centering in 518x518 square
+            pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
+            pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+            mask_nodes_image[:, 0] += pad_w
+            mask_nodes_image[:, 1] += pad_h
+            
+            # Sample depth from VGGT depth map at face landmark positions
+            # Clamp coordinates to valid range
+            u_coords = np.clip(mask_nodes_image[:, 0].astype(int), 0, vggt_fixed_resolution - 1)
+            v_coords = np.clip(mask_nodes_image[:, 1].astype(int), 0, vggt_fixed_resolution - 1)
+            
+            # Get depth values from VGGT depth map
+            sampled_depths = depth[v_coords, u_coords]
+            
+            # Replace MediaPipe z with VGGT depth for consistent scale
+            # Ensure sampled_depths is 1D array to match the slice shape
+            if sampled_depths.ndim > 1:
+                sampled_depths = sampled_depths.flatten()
+            mask_nodes_image[:, 2] = sampled_depths
+            
+            # Transform from image coordinates to camera coordinates using intrinsics
+            fx, fy = intrinsic[i, 0, 0], intrinsic[i, 1, 1]
+            cx, cy = intrinsic[i, 0, 2], intrinsic[i, 1, 2]
+            
+            # Unproject to 3D camera coordinates
+            mask_nodes_camera = np.zeros_like(mask_nodes_image)
+            mask_nodes_camera[:, 0] = (mask_nodes_image[:, 0] - cx) * mask_nodes_image[:, 2] / fx
+            mask_nodes_camera[:, 1] = (mask_nodes_image[:, 1] - cy) * mask_nodes_image[:, 2] / fy
+            mask_nodes_camera[:, 2] = mask_nodes_image[:, 2]
+            
+            # Transform from camera coordinates to world coordinates using extrinsics
+            # extrinsic transforms world to camera, so we need the inverse
+            R = extrinsic[i, :3, :3]
+            t = extrinsic[i, :3, 3]
+            
+            # Transform: world = R.T @ (camera - t)
+            # First subtract translation, then apply rotation transpose
+            mask_nodes_world = (R.T @ (mask_nodes_camera - t).T).T
+
+            mask = Mesh()
+            mask.addVertices(mask_nodes_world)
+            mask.addTexCoords(uvs)
+            mask.addTriangles(faces)
+            # mask.toPly(mask_ply_path)
+            mask.toObj(mask_obj_path)
+
+            # Get confidence values at face landmark positions
+            landmark_depth_confidence = depth_conf[i][v_coords, u_coords]
+
+            agregate_masks_node_positions.append(mask_nodes_world)
+            normalized_node_weights = (landmark_depth_confidence - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
+            agregate_masks_normalized_weights.append(normalized_node_weights)
+
+            # # Keep only landmarks with high confidence depth
+            # confident_mask = landmark_confidence
+            # mask_nodes_world_filtered = mask_nodes_world[confident_mask]
+            
+            # # Create mapping from old vertex indices to new indices
+            # old_to_new_idx = np.full(len(mask_nodes_world), -1, dtype=int)
+            # old_to_new_idx[confident_mask] = np.arange(np.sum(confident_mask))
+            
+            # # Filter faces - keep only faces where ALL vertices are confident
+            # valid_faces = []
+            # for face in faces:
+            #     # Check if all vertices in this face are in the confident set
+            #     if all(confident_mask[v] for v in face if v < len(confident_mask)):
+            #         # Remap vertex indices to new filtered array
+            #         new_face = [old_to_new_idx[v] for v in face if v < len(confident_mask)]
+            #         if all(idx >= 0 for idx in new_face):  # All vertices successfully mapped
+            #             valid_faces.append(new_face)
+            
+            # faces_filtered = np.array(valid_faces) if valid_faces else np.empty((0, 3), dtype=int)
+            # uvs_filtered = uvs[confident_mask] if len(uvs) == len(mask_nodes_world) else uvs[:len(mask_nodes_world_filtered)]
+            
+            # print(f"Number of face landmarks: {mask_nodes.shape[0]}")
+            # print(f"Face landmarks after confidence filtering: {mask_nodes_world_filtered.shape[0]}")
+            # print(f"Faces after filtering: {len(faces_filtered)}")
+            # print(f"Face landmark depth range: {sampled_depths.min():.4f} - {sampled_depths.max():.4f}")
+
+            # # Only create mesh if we have enough confident landmarks and faces
+            # if mask_nodes_world_filtered.shape[0] > 100 and len(faces_filtered) > 0:
+            #     h = trimesh.Trimesh(vertices=mask_nodes_world_filtered, faces=faces_filtered, process=False)
+            #     if len(uvs_filtered) == len(mask_nodes_world_filtered):
+            #         h.visual.uv = uvs_filtered
+            #     h.export(os.path.join(mask_dir, f"mesh_{i}.ply"))
+            #     print(f"Exported mesh with {len(mask_nodes_world_filtered)} vertices and {len(faces_filtered)} faces")
+            # else:
+            #     print(f"Not enough confident landmarks ({mask_nodes_world_filtered.shape[0]}) or faces ({len(faces_filtered)}) to create mesh for image {i}")
+
+
+        if args.export_depth:
+            depth = depth.copy()
+            # filter depth with confidence mask
+            depth[~conf_mask_original[i]] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
+
+            # calculate the scale factor used to resize original image to square image
+            scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
+            # calculate the padding added to the original image to make it square
+            # after resizing, the padding should also be scaled
+            pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
+            pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+
+            depth = depth[pad_w: pad_w + int(orig_w * scale_factor), pad_h: pad_h + int(orig_h * scale_factor)]
+            
+            # normalize depth for visualization
+            depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
+            depth_img = np.clip(depth_img, 0.0, 1.0)
+            depth_img = (depth_img * 255.0).astype(np.uint8)
+            depth_img = np.repeat(depth_img, 3, axis=-1)
+            depth_img = pil_image.fromarray(depth_img)
+
+            basename = os.path.basename(image_path)
+            basename = os.path.splitext(basename)[0]
+            depth_img.save(os.path.join(depth_dir, f"{basename}.png"))
+
+
+    best_mask_world_points = []
+    if len(agregate_masks_node_positions) == 1:
+        best_mask_world_points = agregate_masks_node_positions[0]
+
+    elif len(agregate_masks_node_positions) > 1:
         
-        # normalize depth for visualization
-        depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
-        depth_img = np.clip(depth_img, 0.0, 1.0)
-        depth_img = (depth_img * 255.0).astype(np.uint8)
-        depth_img = np.repeat(depth_img, 3, axis=-1)
-        depth_img = pil_image.fromarray(depth_img)
+        #  convert agregate_masks_node_positions to numpy array
+        agregate_masks_node_positions = np.array(agregate_masks_node_positions)  # (N_images, N_landmarks, 3)
+        agregate_masks_normalized_weights = np.array(agregate_masks_normalized_weights)  # (N_images, N_landmarks)
 
-        basename = os.path.basename(image_path)
-        basename = os.path.splitext(basename)[0]
-        depth_img.save(os.path.join(depth_dir, f"{basename}.png"))
+        # return the image index number with highest normalize weight for each landmark
+        best_image_indices = np.argmax(agregate_masks_normalized_weights, axis=0)
+        best_masks_normalized_weights = agregate_masks_normalized_weights[best_image_indices, np.arange(len(best_image_indices))]
 
-        # save confidence map
-        confidence = depth_conf[i].copy()
-        confidence = np.rot90(confidence, k=3)  # rotate to match original orientation
-        confidence = confidence[pad_h: pad_h + int(orig_h * scale_factor), pad_w: pad_w + int(orig_w * scale_factor)]
-        confidence_img = (confidence - min_confidence) / (max_confidence - min_confidence)
-        confidence_img = np.clip(confidence_img, 0.0, 1.0)
-        confidence_img = (confidence_img * 255.0).astype(np.uint8)
-        confidence_img = np.repeat(confidence_img, 3, axis=-1)
-        # resize confidence to original image size
-        confidence_img = cv2.resize(confidence_img, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-        confidence_img = pil_image.fromarray(confidence_img)
-        confidence_img.save(os.path.join(confidence_dir, f"{basename}.png"))
+        # A. Pick the best landmark from the image with highest weight
+        best_mask_world_points = []
+        for landmark_idx, image_idx in enumerate(best_image_indices):
+            best_mask_world_points.append(agregate_masks_node_positions[image_idx, landmark_idx])
+        best_mask_world_points = np.array(best_mask_world_points)
+
+        # # B. Average the position of each node so the higher the weight the more it influences the final position
+        # for landmark_idx in range(agregate_masks_node_positions.shape[1]):
+        #     weights = agregate_masks_normalized_weights[:, landmark_idx]
+        #     positions = agregate_masks_node_positions[:, landmark_idx, :]
+        #     weighted_position = np.average(positions, axis=0, weights=weights)
+        #     best_mask_world_points.append(weighted_position)
+        # best_mask_world_points = np.array(best_mask_world_points)
+
+        # filter those points with very low weights
+        weight_threshold = (args.confidence_threshold - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
+        # weight_threshold = 0.1; #max(0.1, weight_threshold)  # at least 0.1
+        weight_mask = best_masks_normalized_weights >= weight_threshold
+
+        # filter the best mask world points
+        filtered_mask_world_points = best_mask_world_points[weight_mask]
+
+        # reorganize faces and uvs based on the weight mask
+        old_to_new_idx = np.full(len(best_mask_world_points), -1, dtype=int)
+        old_to_new_idx[weight_mask] = np.arange(np.sum(weight_mask))
+
+        # Filter faces - keep only faces where ALL vertices are in the confident set
+        valid_faces = []
+        for face in faces:
+            # Check if all vertices in this face are in the confident set
+            if all(weight_mask[v] for v in face if v < len(weight_mask)):
+                # Remap vertex indices to new filtered array
+                new_face = [old_to_new_idx[v] for v in face if v < len(weight_mask)]
+                if all(idx >= 0 for idx in new_face):  # All vertices successfully mapped
+                    valid_faces.append(new_face)
+        
+        faces_filtered = np.array(valid_faces) if valid_faces else np.empty((0, 3), dtype=int)
+        uvs_filtered = uvs[weight_mask] if len(uvs) == len(best_mask_world_points) else uvs[:len(filtered_mask_world_points)]
+
+        # Only create mesh if we have enough confident landmarks and faces
+        agregated_mask_mesh = Mesh()
+        agregated_mask_mesh.addVertices(filtered_mask_world_points)
+        agregated_mask_mesh.addTexCoords(uvs_filtered)
+        agregated_mask_mesh.addTriangles(faces_filtered)
+        # agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
+        agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
+
 
     # filter points
     points_3d = points_3d[conf_mask]
