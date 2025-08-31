@@ -22,6 +22,10 @@ def parse_args():
     parser.add_argument('--extract_texture',
                         action='store_true',
                         help='whether to extract texture map from the input image.')
+    
+    parser.add_argument('--filter_occluded',
+                        action='store_true',
+                        help='whether to filter occluded faces when extracting texture map.')
 
     parser.add_argument('--output',
                         type=str,
@@ -46,9 +50,9 @@ def run(input_image_path, output_path, args):
     colors = nodes_colors(points, image)
 
     if args.extract_texture:
-        texture = unwarp_texture(image, points)
+        texture = unwarp_texture(image, points, filter_occluded=args.filter_occluded)
         texture_path = os.path.splitext(output_path)[0] + '_texture.png'
-        cv2.imwrite(texture_path, cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(texture_path, cv2.cvtColor(texture, cv2.COLOR_RGBA2BGRA))
 
     # flip X and Y axist of points positions to match OBJ coordinate system
     points[:, 0] = -points[:, 0]

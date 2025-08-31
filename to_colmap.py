@@ -11,6 +11,7 @@ import os
 import copy
 
 import argparse
+import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,7 @@ def parse_args():
     parser.add_argument("--confidence_threshold", type=float, default=1.25, help="Confidence threshold value for depth filtering")
     parser.add_argument("--export_depth", action="store_true", default=False, help="Whether to export depth maps")
     parser.add_argument("--export_mask_texture", action="store_true", default=False, help="Whether to export mask texture maps")
+    parser.add_argument("--subdivide_mask", type=int, default=0, help="Amount of times to subdivide the mask mesh")
     return parser.parse_args()
 
 
@@ -174,6 +176,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     agregate_masks_node_positions = []
     agregate_masks_node_colors = []
     agregate_masks_normalized_weights = []
+    agregate_masks_texture = []
 
     for i, depth in enumerate(depth_map):
         image_path = image_path_list[i]
@@ -241,9 +244,10 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
             if args.export_mask_texture:
                 # Export texture map for the mask
-                texture = unwarp_texture(img, mask_nodes)
+                texture = unwarp_texture(img, mask_nodes, filter_occluded=True)
                 texture_path = os.path.splitext(mask_obj_path)[0] + '_texture.png'
-                cv2.imwrite(texture_path, cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(texture_path, cv2.cvtColor(texture, cv2.COLOR_RGBA2BGRA))
+                agregate_masks_texture.append(texture)
 
             mask = Mesh()
             mask.addVertices(mask_nodes_world)
@@ -287,6 +291,12 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
             depth_img.save(os.path.join(depth_dir, f"{basename}.png"))
 
 
+    # filter points
+    points_3d = points_3d[conf_mask]
+    points_xyf = points_xyf[conf_mask]
+    points_rgb = points_rgb[conf_mask]
+
+    # Initialize best mask points and colors
     best_mask_world_points = []
     best_mask_colors = []
     if len(agregate_masks_node_positions) == 1:
@@ -356,6 +366,32 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
         faces_filtered = np.array(valid_faces) if valid_faces else np.empty((0, 3), dtype=int)
         uvs_filtered = uvs[weight_mask] if len(uvs) == len(best_mask_world_points) else uvs[:len(filtered_mask_world_points)]
 
+        # update filtered_mask_world_points and filtered_mask_colors
+        if args.export_mask_texture and len(agregate_masks_texture) > 0:
+            # all textures have the same size and an alpha channel,
+            # average all pixels with alpha > 0 together 
+            # any value with alpha > 0 is considered valid
+            
+            texture_size = agregate_masks_texture[0].shape[:2]
+            aggregated_texture = np.zeros((texture_size[0], texture_size[1], 4), dtype=np.float32)
+            count_texture = np.zeros((texture_size[0], texture_size[1]), dtype=np.float32)
+
+            for texture in agregate_masks_texture:
+                alpha_mask = texture[:, :, 3] > 0
+                aggregated_texture[alpha_mask] += texture[alpha_mask]
+                count_texture[alpha_mask] += 1.0
+
+            # Avoid division by zero
+            count_texture[count_texture == 0] = 1.0
+            averaged_texture = (aggregated_texture / count_texture[:, :, None]).astype(np.uint8)
+
+            # if the alpha is > 0 set alpha to 255
+            averaged_texture[averaged_texture[:, :, 3] > 0, 3] = 255
+
+            texture_path = os.path.join(scene_dir, "mask_texture.png")
+            cv2.imwrite(texture_path, cv2.cvtColor(averaged_texture, cv2.COLOR_RGBA2BGRA))
+            print(f"Saved aggregated mask texture to {texture_path}")
+
         # Only create mesh if we have enough confident landmarks and faces
         agregated_mask_mesh = Mesh()
         agregated_mask_mesh.addVertices(filtered_mask_world_points)
@@ -363,14 +399,38 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
         agregated_mask_mesh.addTriangles(faces_filtered)
         agregated_mask_mesh.addColors(filtered_mask_colors)
         # agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
+
+        if args.subdivide_mask > 0:
+            # subdivide mesh at each vertex of points_3d and points_rgb (with threshold=0.01)
+            total_points = len(points_3d)
+            indices = np.arange(total_points)
+
+            # mix the indices
+            np.random.shuffle(indices)
+
+            # add tqdm progress bar
+            counter = 0
+            with tqdm.tqdm(total=args.subdivide_mask) as pbar:
+                for i in indices:
+                    point = points_3d[i]
+                    color = points_rgb[i]
+
+                    rta = agregated_mask_mesh.subdivideAt(point, color=color, threshold=0.01)
+
+                    if len(rta) > 0:
+                        counter += 1
+                        pbar.update(1)
+
+                    if i >= total_points or counter >= total_points or counter >= args.subdivide_mask:
+                        break
+        
+        # smooth normals
         agregated_mask_mesh.smoothNormals()
+
+        # Save aggregated mask mesh
         agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
 
 
-    # filter points
-    points_3d = points_3d[conf_mask]
-    points_xyf = points_xyf[conf_mask]
-    points_rgb = points_rgb[conf_mask]
 
     print("Converting to COLMAP format")
     reconstruction = batch_np_matrix_to_pycolmap_wo_track(

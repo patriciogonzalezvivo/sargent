@@ -178,12 +178,12 @@ class Mesh:
         v2 = vt2 = vn2 = self.indices[number*3+1] + 1
         v3 = vt3 = vn3 = self.indices[number*3+2] + 1
 
-        if len(self.indices_texcoords) > 0:
+        if len(self.indices_texcoords) > number*3+2:
             vt1 = self.indices_texcoords[number*3] + 1
             vt2 = self.indices_texcoords[number*3+1] + 1
             vt3 = self.indices_texcoords[number*3+2] + 1
 
-        if len(self.indices_normals) > 0:
+        if len(self.indices_normals) > number*3+2:
             vn1 = self.indices_normals[number*3] + 1
             vn2 = self.indices_normals[number*3+1] + 1
             vn3 = self.indices_normals[number*3+2] + 1
@@ -340,6 +340,194 @@ class Mesh:
         
         # Update normal indices to match vertex indices
         self.indices_normals = self.indices.copy()
+
+
+    def subdivideAt( self, point, color=None, uv=None, normal=None, threshold=0.01):
+        """
+        Subdivide faces where a point is close enough to the surface.
+        Interpolates vertex properties (color, UV, normal) at the subdivision point.
+        
+        Args:
+            point: 3D point to test against faces
+            color: Color for the new vertex (if None, will be interpolated)
+            uv: UV coordinate for the new vertex (if None, will be interpolated)
+            normal: Normal for the new vertex (if None, will be interpolated)
+            threshold: Maximum distance from point to face surface for subdivision
+            
+        Returns:
+            List of face indices that were subdivided
+        """
+        if len(self.vertices) == 0 or len(self.indices) == 0:
+            return []
+            
+        point = np.array(point)
+        subdivided_faces = []
+        
+        # Store original data before modification
+        original_vertices = self.vertices.copy()
+        original_indices = self.indices.copy()
+        original_colors = self.vertices_colors.copy() if self.vertices_colors else []
+        original_uvs = self.vertices_texcoords.copy() if self.vertices_texcoords else []
+        original_normals = self.vertices_normals.copy() if self.vertices_normals else []
+        
+        # Track new geometry to add
+        new_triangles = []
+        faces_to_remove = []
+        
+        # Check each face
+        for face_idx in range(0, len(original_indices), 3):
+            i0, i1, i2 = original_indices[face_idx:face_idx+3]
+            
+            # Get triangle vertices
+            v0 = original_vertices[i0]
+            v1 = original_vertices[i1] 
+            v2 = original_vertices[i2]
+            
+            # Calculate barycentric coordinates of point projection onto triangle
+            # Project point onto triangle plane
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            face_normal = np.cross(edge1, edge2)
+            face_normal_len = np.linalg.norm(face_normal)
+            
+            if face_normal_len < 1e-12:  # Degenerate triangle
+                continue
+                
+            face_normal = face_normal / face_normal_len
+            
+            # Distance from point to plane
+            plane_dist = np.dot(point - v0, face_normal)
+            
+            # If point is too far from plane, skip this face
+            if abs(plane_dist) > threshold:
+                continue
+                
+            # Project point onto triangle plane
+            projected_point = point - plane_dist * face_normal
+            
+            # Calculate barycentric coordinates
+            v0_to_point = projected_point - v0
+            
+            dot00 = np.dot(edge1, edge1)
+            dot01 = np.dot(edge1, edge2)
+            dot11 = np.dot(edge2, edge2)
+            dot20 = np.dot(v0_to_point, edge1)
+            dot21 = np.dot(v0_to_point, edge2)
+            
+            denom = dot00 * dot11 - dot01 * dot01
+            if abs(denom) < 1e-12:
+                continue
+                
+            inv_denom = 1.0 / denom
+            u = (dot11 * dot20 - dot01 * dot21) * inv_denom
+            v = (dot00 * dot21 - dot01 * dot20) * inv_denom
+            w = 1.0 - u - v
+            
+            # Check if point is inside triangle (with small tolerance)
+            epsilon = 1e-6
+            if u >= -epsilon and v >= -epsilon and w >= -epsilon:
+                # Point is inside triangle and close enough - subdivide!
+                new_vertex_idx = len(self.vertices)
+                
+                # Add the new vertex at the projected point
+                self.addVertex(projected_point)
+                
+                # Interpolate vertex properties using barycentric coordinates
+                if color is None and original_colors:
+                    # Interpolate color
+                    if i0 < len(original_colors) and i1 < len(original_colors) and i2 < len(original_colors):
+                        c0 = np.array(original_colors[i0])
+                        c1 = np.array(original_colors[i1])
+                        c2 = np.array(original_colors[i2])
+                        interpolated_color = w * c0 + u * c1 + v * c2
+                        self.addColor(interpolated_color)
+                elif color is not None:
+                    self.addColor(color)
+                
+                if uv is None and original_uvs:
+                    # Interpolate UV coordinates
+                    if i0 < len(original_uvs) and i1 < len(original_uvs) and i2 < len(original_uvs):
+                        uv0 = np.array(original_uvs[i0])
+                        uv1 = np.array(original_uvs[i1])
+                        uv2 = np.array(original_uvs[i2])
+                        interpolated_uv = w * uv0 + u * uv1 + v * uv2
+                        self.addTexCoord(interpolated_uv)
+                elif uv is not None:
+                    self.addTexCoord(uv)
+                
+                if normal is None and original_normals:
+                    # Interpolate normal
+                    if i0 < len(original_normals) and i1 < len(original_normals) and i2 < len(original_normals):
+                        n0 = np.array(original_normals[i0])
+                        n1 = np.array(original_normals[i1])
+                        n2 = np.array(original_normals[i2])
+                        interpolated_normal = w * n0 + u * n1 + v * n2
+                        # Normalize the interpolated normal
+                        normal_len = np.linalg.norm(interpolated_normal)
+                        if normal_len > 1e-12:
+                            interpolated_normal = interpolated_normal / normal_len
+                        self.addNormal(interpolated_normal)
+                elif normal is not None:
+                    self.addNormal(normal)
+                
+                # Create three new triangles to replace the original
+                new_triangles.extend([
+                    [i0, i1, new_vertex_idx],
+                    [i1, i2, new_vertex_idx], 
+                    [i2, i0, new_vertex_idx]
+                ])
+                
+                faces_to_remove.append(face_idx // 3)
+                subdivided_faces.append(face_idx // 3)
+        
+        # Remove original faces and add new triangles
+        if faces_to_remove:
+            # Store texture coordinate indices for new vertex before removing faces
+            new_vertex_tex_idx = len(self.vertices_texcoords) - 1 if self.vertices_texcoords and uv is not None or (uv is None and original_uvs) else -1
+            new_vertex_normal_idx = len(self.vertices_normals) - 1 if self.vertices_normals and normal is not None or (normal is None and original_normals) else -1
+            
+            # Remove faces in reverse order to maintain indices
+            for face_idx in sorted(faces_to_remove, reverse=True):
+                start_idx = face_idx * 3
+                # Remove from indices
+                del self.indices[start_idx:start_idx+3]
+                # Remove corresponding normal and texture indices if they exist
+                if len(self.indices_normals) > start_idx:
+                    del self.indices_normals[start_idx:start_idx+3]
+                if len(self.indices_texcoords) > start_idx:
+                    del self.indices_texcoords[start_idx:start_idx+3]
+            
+            # Add new triangles with proper texture coordinate and normal indices
+            for triangle in new_triangles:
+                self.addTriangle(triangle[0], triangle[1], triangle[2])
+                
+                # Add corresponding normal indices - use existing vertex normal indices where possible
+                if self.vertices_normals and len(self.indices_normals) > 0:
+                    # For the new vertex, use its normal index, for existing vertices use their indices
+                    normal_indices = []
+                    for vertex_idx in triangle:
+                        if vertex_idx == new_vertex_idx and new_vertex_normal_idx >= 0:
+                            normal_indices.append(new_vertex_normal_idx)
+                        else:
+                            # Use the vertex index as normal index (assuming 1:1 mapping)
+                            normal_indices.append(vertex_idx)
+                    self.addNormalTriangle(normal_indices[0], normal_indices[1], normal_indices[2])
+                
+                # Add corresponding texture coordinate indices - use existing vertex texture indices where possible  
+                if self.vertices_texcoords and len(self.indices_texcoords) > 0:
+                    # For the new vertex, use its texture index, for existing vertices use their indices
+                    tex_indices = []
+                    for vertex_idx in triangle:
+                        if vertex_idx == new_vertex_idx and new_vertex_tex_idx >= 0:
+                            tex_indices.append(new_vertex_tex_idx)
+                        else:
+                            # Use the vertex index as texture index (assuming 1:1 mapping)
+                            tex_indices.append(vertex_idx)
+                    self.addTexCoordTriangle(tex_indices[0], tex_indices[1], tex_indices[2])
+        
+        return subdivided_faces
+
+
 
     def scale( self, scale ):
         mat = mat4_scale(scale)

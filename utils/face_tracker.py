@@ -101,17 +101,21 @@ def find_triangle(uv: np.ndarray, faces: np.ndarray, uvs: np.ndarray) -> int | N
 
 
 # given the original image and the detected nodes, create a new square texture image that unwraps the face on the original image
-def unwarp_texture(face_img: np.ndarray, nodes: np.ndarray, texture_size: int = 512) -> np.ndarray:
+def unwarp_texture(face_img: np.ndarray, nodes: np.ndarray, texture_size: int = 512, filter_occluded=False, faces=None, canonical_uv=None) -> np.ndarray:
     """Fast vectorized texture unwrapping using precomputed mapping."""
     h, w, _ = face_img.shape
     
     # Get face triangles and UV coordinates
-    faces = nodes_faces()
-    canonical_uv = nodes_uvs()
+    if faces is None:
+        faces = nodes_faces()
+
+    if canonical_uv is None:
+        canonical_uv = nodes_uvs()
+
     nodes_xy = nodes[:, :2]
     
-    # Create output texture
-    texture = np.zeros((texture_size, texture_size, 3), dtype=np.uint8)
+    # Create output texture with alpha channel
+    texture = np.zeros((texture_size, texture_size, 4), dtype=np.uint8)
     
     # Create coordinate grids for the entire texture
     u_coords = np.linspace(0, 1, texture_size, endpoint=False) + 0.5/texture_size
@@ -178,10 +182,44 @@ def unwarp_texture(face_img: np.ndarray, nodes: np.ndarray, texture_size: int = 
     map_x = np.clip(map_x, 0, w - 1)
     map_y = np.clip(map_y, 0, h - 1)
     
-    # Use OpenCV's fast remap for interpolation
-    texture = cv2.remap(face_img, map_x.astype(np.float32), map_y.astype(np.float32), 
-                       cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    # Use OpenCV's fast remap for interpolation (RGB channels only)
+    texture_rgb = cv2.remap(face_img, map_x.astype(np.float32), map_y.astype(np.float32), 
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+    # Copy RGB channels to RGBA texture
+    texture[:, :, :3] = texture_rgb
     
+    # Initialize alpha channel to full opacity using valid mask
+    texture[:, :, 3] = (valid_mask * 255).astype(np.uint8)
+    
+    # compute normal for each face
+    if filter_occluded:
+        face_normals = np.cross(
+            nodes[faces[:, 1], :3] - nodes[faces[:, 0], :3],
+            nodes[faces[:, 2], :3] - nodes[faces[:, 0], :3]
+        )
+        face_normals /= np.linalg.norm(face_normals, axis=1, keepdims=True) + 1e-8
+        
+        # determine if face is front-facing
+        view_direction = np.array([0, 0, 1])
+        front_facing = face_normals[:, 2] < -0.375
+
+        # front_facing = np.einsum('ij,j->i', face_normals, view_direction) < -0.3
+
+        face_validity = np.zeros(faces.shape[0], dtype=bool)
+        face_validity[front_facing] = True
+        
+        # create a mask of valid pixels for alpha channel
+        alpha_mask = np.zeros((texture_size, texture_size), dtype=np.uint8)
+        for i, face in enumerate(faces):
+            if face_validity[i]:
+                # rasterize triangle to alpha mask
+                uv_tri = (canonical_uv[face] * texture_size).astype(np.int32)
+                cv2.fillConvexPoly(alpha_mask, uv_tri, 255)
+
+        # apply face validity to alpha channel (take the minimum value)
+        texture[:, :, 3] = np.minimum(texture[:, :, 3], alpha_mask)
+        
     # flip texture vertically to match UV coordinate system
     texture = cv2.flip(texture, 0)
     
