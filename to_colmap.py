@@ -423,7 +423,10 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
                     if i >= total_points or counter >= total_points or counter >= args.subdivide_mask:
                         break
-        
+
+                if counter % 10 == 0:
+                    agregated_mask_mesh.isotropicRemesh(max_iterations=1)
+
         # smooth normals
         agregated_mask_mesh.smoothNormals()
 

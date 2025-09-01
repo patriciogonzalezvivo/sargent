@@ -114,13 +114,22 @@ class Mesh:
             self.addColor(vc)
 
     def colorString( self, index, alpha = True ):
-        if len(self.vertices_colors[index]) == 3:
-            return f' {self.vertices_colors[index][0]:d} {self.vertices_colors[index][1]:d} {self.vertices_colors[index][2]:d}'
-        elif len(self.vertices_colors[index]) == 4:
-            if alpha:
-                return f' {self.vertices_colors[index][0]:f} {self.vertices_colors[index][1]:f} {self.vertices_colors[index][2]:f} {self.vertices_colors[index][3]:f}'
+        color = self.vertices_colors[index]
+        if len(color) == 3:
+            # Check if color values are integers or floats and format accordingly
+            if all(isinstance(c, (int, np.integer)) for c in color):
+                return f' {int(color[0]):d} {int(color[1]):d} {int(color[2]):d}'
             else:
-                return f' {self.vertices_colors[index][0]:f} {self.vertices_colors[index][1]:f} {self.vertices_colors[index][2]:f}'
+                # Convert float colors to integers (0-255 range) for 3-component colors
+                r = int(np.clip(color[0], 0, 255))
+                g = int(np.clip(color[1], 0, 255))
+                b = int(np.clip(color[2], 0, 255))
+                return f' {r:d} {g:d} {b:d}'
+        elif len(color) == 4:
+            if alpha:
+                return f' {float(color[0]):f} {float(color[1]):f} {float(color[2]):f} {float(color[3]):f}'
+            else:
+                return f' {float(color[0]):f} {float(color[1]):f} {float(color[2]):f}'
 
     # EDGES
 
@@ -376,7 +385,9 @@ class Mesh:
         
         # Check each face
         for face_idx in range(0, len(original_indices), 3):
-            i0, i1, i2 = original_indices[face_idx:face_idx+3]
+            i0 = original_indices[face_idx]
+            i1 = original_indices[face_idx + 1] 
+            i2 = original_indices[face_idx + 2]
             
             # Get triangle vertices
             v0 = original_vertices[i0]
@@ -527,6 +538,565 @@ class Mesh:
         
         return subdivided_faces
 
+
+    def isotropicRemesh(self,max_iterations=10):
+        """
+        Perform isotropic remeshing to create uniform triangle sizes.
+        
+        This implements a simplified version of the algorithm:
+        1. Split edges longer than target_edge_length * 1.33
+        2. Collapse edges shorter than target_edge_length * 0.8
+        3. Flip edges to improve triangle quality
+        4. Smooth vertex positions (Laplacian smoothing)
+        
+        Args:
+            target_edge_length: Desired edge length for the mesh
+            max_iterations: Maximum number of remeshing iterations
+        """
+        if len(self.vertices) == 0 or len(self.indices) == 0:
+            return
+        
+        # Figurate out what's the target edge length based on the current average edge length
+        total_edge_length = 0.0
+        edge_count = 0
+        
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1] 
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            # Calculate lengths of the three edges of the triangle
+            v0 = self.vertices[i0]
+            v1 = self.vertices[i1]
+            v2 = self.vertices[i2]
+            
+            edge_lengths = [
+                np.linalg.norm(v1 - v0),
+                np.linalg.norm(v2 - v1),
+                np.linalg.norm(v0 - v2)
+            ]
+            
+            total_edge_length += sum(edge_lengths)
+            edge_count += 3
+        
+        if edge_count == 0:
+            print("No edges found in mesh")
+            return
+        
+        average_edge_length = total_edge_length / edge_count
+        target_edge_length = average_edge_length
+        
+        high_threshold = target_edge_length * 1.1
+        low_threshold = target_edge_length * 0.9
+        
+        self.checkVertexConsistency()
+        
+        for iteration in range(max_iterations):
+            initial_vertices = len(self.vertices)
+            initial_faces = self.totalFaces()
+            
+            # Step 1: Split long edges
+            self.splitLongEdges(high_threshold)
+            
+            # Step 2: Collapse short edges  
+            self.collapseShortEdges(low_threshold)
+            
+            # Step 3: Remove degenerate triangles
+            self.removeDegenerateTriangles()
+            
+            # Step 4: Clean up unused vertices after edge collapse
+            self.cleanupUnusedVertices()
+            
+            # # Step 5: Edge flipping for better triangulation
+            # self.flipEdges()
+            
+            # Step 6: Vertex smoothing
+            self.smoothVertices()
+            
+            final_vertices = len(self.vertices)
+            
+            # Check consistency after each iteration
+            if not self.checkVertexConsistency():
+                print("  WARNING: Vertex consistency issues detected!")
+            
+            # Early termination if mesh is stable
+            if abs(final_vertices - initial_vertices) < initial_vertices * 0.01:
+                print(f"Mesh stabilized after {iteration + 1} iterations")
+                break
+        
+        # Final cleanup: recalculate normals
+        if len(self.vertices_normals) > 0:
+            self.smoothNormals()
+        
+        # # Final degenerate triangle removal
+        # self.removeDegenerateTriangles()
+        
+        # self.checkVertexConsistency()
+        # self.validateMesh()
+
+
+    def splitLongEdges(self, threshold):
+        """Split edges longer than threshold by adding midpoint vertices - hole-safe version."""
+        if len(self.vertices) == 0 or len(self.indices) == 0:
+            return
+        
+        # Take a snapshot of the current mesh state
+        original_indices = self.indices.copy()
+        original_vertices = self.vertices.copy()
+        original_colors = self.vertices_colors.copy() if self.vertices_colors else []
+        original_uvs = self.vertices_texcoords.copy() if self.vertices_texcoords else []
+        original_normals = self.vertices_normals.copy() if self.vertices_normals else []
+        
+        # Build edge-to-faces mapping from original state
+        edge_faces = {}
+        edges_to_split = []
+        
+        # First pass: identify all edges that need splitting
+        for face_idx in range(len(original_indices) // 3):
+            i0 = original_indices[face_idx * 3]
+            i1 = original_indices[face_idx * 3 + 1] 
+            i2 = original_indices[face_idx * 3 + 2]
+            
+            # Check each edge of the triangle
+            edges = [(i0, i1), (i1, i2), (i2, i0)]
+            
+            for edge in edges:
+                # Normalize edge direction (smaller index first)
+                edge_key = tuple(sorted(edge))
+                
+                if edge_key not in edge_faces:
+                    edge_faces[edge_key] = []
+                edge_faces[edge_key].append(face_idx)
+                
+                # Check edge length using original vertices
+                v0 = original_vertices[edge[0]]
+                v1 = original_vertices[edge[1]]
+                edge_length = np.linalg.norm(v1 - v0)
+                
+                if edge_length > threshold:
+                    # Only add if not already in list
+                    if edge_key not in [e[0] for e in edges_to_split]:
+                        edges_to_split.append((edge_key, edge_length, face_idx))
+        
+        if not edges_to_split:
+            return  # No edges to split
+        
+        # Sort by edge length (split longest first for better stability)
+        edges_to_split.sort(key=lambda x: x[1], reverse=True)
+        
+        # Clear current mesh state - we'll rebuild it
+        self.indices = []
+        if self.indices_normals:
+            self.indices_normals = []
+        if self.indices_texcoords:
+            self.indices_texcoords = []
+        
+        # Track which edges have been split and their new midpoint vertices
+        split_edges = {}  # edge_key -> midpoint_vertex_index
+        
+        # Create all midpoint vertices first
+        for edge_key, edge_length, _ in edges_to_split:
+            if edge_key not in split_edges:
+                v0_idx, v1_idx = edge_key
+                v0 = original_vertices[v0_idx]
+                v1 = original_vertices[v1_idx]
+                
+                # Create midpoint vertex
+                midpoint = (v0 + v1) * 0.5
+                mid_idx = len(self.vertices)
+                self.vertices.append(midpoint)
+                split_edges[edge_key] = mid_idx
+                
+                # Interpolate vertex properties
+                if original_colors and v0_idx < len(original_colors) and v1_idx < len(original_colors):
+                    color0 = np.array(original_colors[v0_idx])
+                    color1 = np.array(original_colors[v1_idx])
+                    # Ensure colors are the same data type and properly interpolated
+                    if color0.dtype == color1.dtype:
+                        mid_color = (color0.astype(np.float64) + color1.astype(np.float64)) * 0.5
+                        # Convert back to original data type
+                        if color0.dtype in [np.uint8, np.int32, np.int64]:
+                            mid_color = mid_color.astype(color0.dtype)
+                        else:
+                            mid_color = mid_color.astype(np.float32)
+                    else:
+                        # Fallback to float interpolation
+                        mid_color = (color0.astype(np.float32) + color1.astype(np.float32)) * 0.5
+                    self.vertices_colors.append(mid_color)
+                elif original_colors and len(original_colors) > 0:
+                    # Use the first available color as default (better than gray)
+                    if v0_idx < len(original_colors):
+                        self.vertices_colors.append(np.array(original_colors[v0_idx]))
+                    elif v1_idx < len(original_colors):
+                        self.vertices_colors.append(np.array(original_colors[v1_idx]))
+                    else:
+                        # Use a color that matches the format of existing colors
+                        sample_color = original_colors[0]
+                        if sample_color.dtype in [np.uint8, np.int32, np.int64]:
+                            self.vertices_colors.append(np.array([128, 128, 128], dtype=sample_color.dtype))
+                        else:
+                            self.vertices_colors.append(np.array([0.5, 0.5, 0.5], dtype=sample_color.dtype))
+                
+                if original_uvs and v0_idx < len(original_uvs) and v1_idx < len(original_uvs):
+                    uv0 = np.array(original_uvs[v0_idx])
+                    uv1 = np.array(original_uvs[v1_idx])
+                    mid_uv = (uv0 + uv1) * 0.5
+                    self.vertices_texcoords.append(mid_uv)
+                elif original_uvs and len(original_uvs) > 0:
+                    # Use the first available UV as default
+                    if v0_idx < len(original_uvs):
+                        self.vertices_texcoords.append(np.array(original_uvs[v0_idx]))
+                    elif v1_idx < len(original_uvs):
+                        self.vertices_texcoords.append(np.array(original_uvs[v1_idx]))
+                    else:
+                        # Use a default UV coordinate
+                        self.vertices_texcoords.append(np.array([0.5, 0.5]))
+                
+                if original_normals and v0_idx < len(original_normals) and v1_idx < len(original_normals):
+                    n0 = np.array(original_normals[v0_idx])
+                    n1 = np.array(original_normals[v1_idx])
+                    mid_normal = (n0 + n1) * 0.5
+                    # Normalize the interpolated normal
+                    norm_len = np.linalg.norm(mid_normal)
+                    if norm_len > 1e-12:
+                        mid_normal = mid_normal / norm_len
+                    else:
+                        mid_normal = np.array([0.0, 0.0, 1.0])
+                    self.vertices_normals.append(mid_normal)
+                elif original_normals and len(original_normals) > 0:
+                    # Use the first available normal as default
+                    if v0_idx < len(original_normals):
+                        self.vertices_normals.append(np.array(original_normals[v0_idx]))
+                    elif v1_idx < len(original_normals):
+                        self.vertices_normals.append(np.array(original_normals[v1_idx]))
+                    else:
+                        # Use default normal
+                        self.vertices_normals.append(np.array([0.0, 0.0, 1.0]))
+        
+        # Now rebuild all faces, splitting them where necessary
+        for face_idx in range(len(original_indices) // 3):
+            i0 = original_indices[face_idx * 3]
+            i1 = original_indices[face_idx * 3 + 1]
+            i2 = original_indices[face_idx * 3 + 2]
+            
+            # Check which edges of this triangle were split
+            edge01 = tuple(sorted([i0, i1]))
+            edge12 = tuple(sorted([i1, i2]))
+            edge20 = tuple(sorted([i2, i0]))
+            
+            split01 = edge01 in split_edges
+            split12 = edge12 in split_edges
+            split20 = edge20 in split_edges
+            
+            # Generate new triangles based on which edges were split
+            if not split01 and not split12 and not split20:
+                # No edges split - keep original triangle
+                self._add_triangle_with_attributes(i0, i1, i2)
+            
+            elif split01 and not split12 and not split20:
+                # Only edge 01 split
+                mid01 = split_edges[edge01]
+                self._add_triangle_with_attributes(i0, mid01, i2)
+                self._add_triangle_with_attributes(mid01, i1, i2)
+            
+            elif not split01 and split12 and not split20:
+                # Only edge 12 split
+                mid12 = split_edges[edge12]
+                self._add_triangle_with_attributes(i0, i1, mid12)
+                self._add_triangle_with_attributes(i0, mid12, i2)
+            
+            elif not split01 and not split12 and split20:
+                # Only edge 20 split
+                mid20 = split_edges[edge20]
+                self._add_triangle_with_attributes(i0, i1, mid20)
+                self._add_triangle_with_attributes(i1, i2, mid20)
+            
+            elif split01 and split12 and not split20:
+                # Edges 01 and 12 split
+                mid01 = split_edges[edge01]
+                mid12 = split_edges[edge12]
+                self._add_triangle_with_attributes(i0, mid01, i2)
+                self._add_triangle_with_attributes(mid01, i1, mid12)
+                self._add_triangle_with_attributes(mid01, mid12, i2)
+            
+            elif split01 and not split12 and split20:
+                # Edges 01 and 20 split
+                mid01 = split_edges[edge01]
+                mid20 = split_edges[edge20]
+                self._add_triangle_with_attributes(i0, mid01, mid20)
+                self._add_triangle_with_attributes(mid01, i1, i2)
+                self._add_triangle_with_attributes(mid01, i2, mid20)
+            
+            elif not split01 and split12 and split20:
+                # Edges 12 and 20 split
+                mid12 = split_edges[edge12]
+                mid20 = split_edges[edge20]
+                self._add_triangle_with_attributes(i0, i1, mid12)
+                self._add_triangle_with_attributes(i0, mid12, mid20)
+                self._add_triangle_with_attributes(mid12, i2, mid20)
+            
+            else:
+                # All three edges split
+                mid01 = split_edges[edge01]
+                mid12 = split_edges[edge12]
+                mid20 = split_edges[edge20]
+                # Create 4 triangles
+                self._add_triangle_with_attributes(i0, mid01, mid20)
+                self._add_triangle_with_attributes(mid01, i1, mid12)
+                self._add_triangle_with_attributes(mid12, i2, mid20)
+                self._add_triangle_with_attributes(mid01, mid12, mid20)
+
+    def _add_triangle_with_attributes(self, i0, i1, i2):
+        """Helper function to add a triangle with proper attribute indices."""
+        # Add vertex indices
+        self.indices.extend([i0, i1, i2])
+        
+        # Add normal indices if normals exist
+        if self.vertices_normals and len(self.indices_normals) is not None:
+            self.indices_normals.extend([i0, i1, i2])
+        
+        # Add texture coordinate indices if UVs exist
+        if self.vertices_texcoords and len(self.indices_texcoords) is not None:
+            self.indices_texcoords.extend([i0, i1, i2])
+
+    def collapseShortEdges(self, threshold):
+        """Collapse edges shorter than threshold."""
+        # Find short edges
+        edges_to_collapse = []
+        
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1]
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            edges = [(i0, i1), (i1, i2), (i2, i0)]
+            
+            for edge in edges:
+                v0 = self.vertices[edge[0]]
+                v1 = self.vertices[edge[1]]
+                edge_length = np.linalg.norm(v1 - v0)
+                
+                if edge_length < threshold:
+                    edge_key = tuple(sorted(edge))
+                    if edge_key not in edges_to_collapse:
+                        edges_to_collapse.append(edge_key)
+        
+        # Collapse edges by merging vertices (more conservative approach)
+        vertex_mapping = {}
+        
+        for edge in edges_to_collapse[:len(edges_to_collapse)//3]:  # Even more conservative limit
+            v0_idx, v1_idx = edge
+            
+            # Skip if vertices already mapped
+            if v0_idx in vertex_mapping or v1_idx in vertex_mapping:
+                continue
+                
+            # Check if this collapse would create degenerate triangles
+            # Find all faces that use either vertex
+            affected_faces = []
+            for face_idx in range(self.totalFaces()):
+                face_verts = [self.indices[face_idx * 3 + i] for i in range(3)]
+                if v0_idx in face_verts or v1_idx in face_verts:
+                    affected_faces.append((face_idx, face_verts))
+            
+            # Check if merging these vertices would create degenerate faces
+            would_create_degenerate = False
+            for face_idx, face_verts in affected_faces:
+                # Simulate the vertex mapping
+                simulated_verts = []
+                for v in face_verts:
+                    if v == v1_idx:
+                        simulated_verts.append(v0_idx)
+                    else:
+                        simulated_verts.append(v)
+                
+                # Check if this creates a degenerate triangle
+                if len(set(simulated_verts)) < 3:
+                    would_create_degenerate = True
+                    break
+            
+            if would_create_degenerate:
+                continue
+            
+            # Safe to proceed with collapse
+            # Average vertex positions
+            v0 = self.vertices[v0_idx]
+            v1 = self.vertices[v1_idx]
+            avg_pos = (v0 + v1) * 0.5
+            
+            # Update the first vertex position
+            self.vertices[v0_idx] = avg_pos
+            
+            # Interpolate vertex properties for the merged vertex
+            if len(self.vertices_colors) > v0_idx and len(self.vertices_colors) > v1_idx:
+                color0 = np.array(self.vertices_colors[v0_idx])
+                color1 = np.array(self.vertices_colors[v1_idx])
+                avg_color = (color0 + color1) * 0.5
+                self.vertices_colors[v0_idx] = avg_color
+            
+            if len(self.vertices_texcoords) > v0_idx and len(self.vertices_texcoords) > v1_idx:
+                uv0 = np.array(self.vertices_texcoords[v0_idx])
+                uv1 = np.array(self.vertices_texcoords[v1_idx])
+                avg_uv = (uv0 + uv1) * 0.5
+                self.vertices_texcoords[v0_idx] = avg_uv
+            
+            if len(self.vertices_normals) > v0_idx and len(self.vertices_normals) > v1_idx:
+                n0 = np.array(self.vertices_normals[v0_idx])
+                n1 = np.array(self.vertices_normals[v1_idx])
+                avg_normal = (n0 + n1) * 0.5
+                # Normalize the interpolated normal
+                norm_len = np.linalg.norm(avg_normal)
+                if norm_len > 1e-12:
+                    avg_normal = avg_normal / norm_len
+                self.vertices_normals[v0_idx] = avg_normal
+            
+            # Map second vertex to first
+            vertex_mapping[v1_idx] = v0_idx
+        
+        # Update face indices to use merged vertices
+        for i in range(len(self.indices)):
+            if self.indices[i] in vertex_mapping:
+                self.indices[i] = vertex_mapping[self.indices[i]]
+        
+        # Update normal and texture coordinate indices
+        for i in range(len(self.indices_normals)):
+            if self.indices_normals[i] in vertex_mapping:
+                self.indices_normals[i] = vertex_mapping[self.indices_normals[i]]
+        
+        for i in range(len(self.indices_texcoords)):
+            if self.indices_texcoords[i] in vertex_mapping:
+                self.indices_texcoords[i] = vertex_mapping[self.indices_texcoords[i]]
+
+    def flipEdges(self):
+        """Flip edges to improve triangle quality (basic Delaunay-like flipping)."""
+        # Build adjacency information
+        edge_triangles = {}
+        
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1]
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            edges = [
+                (min(i0, i1), max(i0, i1)),
+                (min(i1, i2), max(i1, i2)), 
+                (min(i2, i0), max(i2, i0))
+            ]
+            
+            for edge in edges:
+                if edge not in edge_triangles:
+                    edge_triangles[edge] = []
+                edge_triangles[edge].append(face_idx)
+        
+        # Find edges shared by exactly two triangles
+        flips_performed = 0
+        max_flips = self.totalFaces() // 10  # Limit flips per iteration
+        
+        for edge, triangles in edge_triangles.items():
+            if len(triangles) == 2 and flips_performed < max_flips:
+                face0_idx, face1_idx = triangles
+                
+                # Get triangle vertices
+                tri0 = [self.indices[face0_idx * 3 + i] for i in range(3)]
+                tri1 = [self.indices[face1_idx * 3 + i] for i in range(3)]
+                
+                # Find the non-shared vertices
+                shared_verts = set(tri0) & set(tri1)
+                if len(shared_verts) != 2:
+                    continue
+                
+                non_shared0_list = [v for v in tri0 if v not in shared_verts]
+                non_shared1_list = [v for v in tri1 if v not in shared_verts]
+                
+                # Skip if we don't have exactly one non-shared vertex per triangle
+                if len(non_shared0_list) != 1 or len(non_shared1_list) != 1:
+                    continue
+                    
+                non_shared0 = non_shared0_list[0]
+                non_shared1 = non_shared1_list[0]
+                
+                # Simple quality check: flip if it improves minimum angle
+                if self._should_flip_edge(list(shared_verts) + [non_shared0, non_shared1]):
+                    # Perform the flip
+                    shared_list = list(shared_verts)
+                    self.indices[face0_idx * 3:face0_idx * 3 + 3] = [non_shared0, shared_list[0], non_shared1]
+                    self.indices[face1_idx * 3:face1_idx * 3 + 3] = [non_shared1, shared_list[1], non_shared0]
+                    flips_performed += 1
+
+    def _should_flip_edge(self, quad_vertices):
+        """Simple heuristic to determine if edge flip improves triangle quality."""
+        if len(quad_vertices) != 4:
+            return False
+        
+        # Calculate the two possible triangulations and compare their minimum angles
+        v = [self.vertices[i] for i in quad_vertices]
+        
+        # Current triangulation: (0,1,2) and (0,2,3)
+        angle1_min = min(self._triangle_min_angle(v[0], v[1], v[2]), 
+                        self._triangle_min_angle(v[0], v[2], v[3]))
+        
+        # Alternative triangulation: (0,1,3) and (1,2,3) 
+        angle2_min = min(self._triangle_min_angle(v[0], v[1], v[3]),
+                        self._triangle_min_angle(v[1], v[2], v[3]))
+        
+        # Flip if alternative has better minimum angle
+        return angle2_min > angle1_min
+
+    def _triangle_min_angle(self, v0, v1, v2):
+        """Calculate the minimum angle in a triangle."""
+        edges = [v1 - v0, v2 - v1, v0 - v2]
+        edge_lengths = [np.linalg.norm(e) for e in edges]
+        
+        if any(length < 1e-12 for length in edge_lengths):
+            return 0.0
+        
+        # Use law of cosines to find angles
+        angles = []
+        for i in range(3):
+            a, b, c = edge_lengths[i], edge_lengths[(i+1)%3], edge_lengths[(i+2)%3]
+            cos_angle = (b*b + c*c - a*a) / (2.0 * b * c)
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            angle = np.arccos(cos_angle)
+            angles.append(angle)
+        
+        return min(angles)
+
+
+    def smoothVertices(self, iterations=1, factor=0.5):
+        """Apply Laplacian smoothing to vertex positions."""
+        for _ in range(iterations):
+            # Build vertex adjacency
+            adjacency = [[] for _ in range(len(self.vertices))]
+            
+            for face_idx in range(self.totalFaces()):
+                i0 = self.indices[face_idx * 3]
+                i1 = self.indices[face_idx * 3 + 1]
+                i2 = self.indices[face_idx * 3 + 2]
+                
+                adjacency[i0].extend([i1, i2])
+                adjacency[i1].extend([i0, i2])
+                adjacency[i2].extend([i0, i1])
+            
+            # Remove duplicates
+            for i in range(len(adjacency)):
+                adjacency[i] = list(set(adjacency[i]))
+            
+            # Calculate new positions
+            new_positions = []
+            for i, vertex in enumerate(self.vertices):
+                if len(adjacency[i]) > 0:
+                    # Average of neighboring vertices
+                    neighbor_sum = np.sum([self.vertices[j] for j in adjacency[i]], axis=0)
+                    neighbor_avg = neighbor_sum / len(adjacency[i])
+                    
+                    # Blend with original position
+                    new_pos = vertex * (1.0 - factor) + neighbor_avg * factor
+                    new_positions.append(new_pos)
+                else:
+                    new_positions.append(vertex.copy())
+            
+            # Update vertex positions
+            self.vertices = new_positions
 
 
     def scale( self, scale ):
@@ -1057,4 +1627,211 @@ property float z
         blender_mesh.validate()
 
         return blender_mesh
+
+    def checkVertexConsistency(self):
+        """Check if vertex counts are consistent across all vertex attributes."""
+        vertex_count = len(self.vertices)
+        color_count = len(self.vertices_colors)
+        uv_count = len(self.vertices_texcoords)
+        normal_count = len(self.vertices_normals)
+        
+        if color_count > 0 and color_count != vertex_count:
+            print(f"  WARNING: Color count mismatch! Expected {vertex_count}, got {color_count}")
+            return False
+            
+        if uv_count > 0 and uv_count != vertex_count:
+            print(f"  WARNING: UV count mismatch! Expected {vertex_count}, got {uv_count}")
+            return False
+            
+        if normal_count > 0 and normal_count != vertex_count:
+            print(f"  WARNING: Normal count mismatch! Expected {vertex_count}, got {normal_count}")
+            return False
+        return True
+
+    def cleanupUnusedVertices(self):
+        """Remove vertices that are not referenced by any face and update indices."""
+        if len(self.vertices) == 0 or len(self.indices) == 0:
+            return
+            
+        # Find which vertices are actually used
+        used_vertices = set(self.indices)
+        
+        # If all vertices are used, no cleanup needed
+        if len(used_vertices) == len(self.vertices):
+            return
+            
+        print(f"Cleaning up unused vertices: {len(self.vertices)} -> {len(used_vertices)}")
+        
+        # Create mapping from old indices to new indices
+        old_to_new = {}
+        new_vertices = []
+        new_colors = []
+        new_uvs = []
+        new_normals = []
+        
+        new_idx = 0
+        for old_idx in range(len(self.vertices)):
+            if old_idx in used_vertices:
+                old_to_new[old_idx] = new_idx
+                new_vertices.append(self.vertices[old_idx])
+                
+                if len(self.vertices_colors) > old_idx:
+                    new_colors.append(self.vertices_colors[old_idx])
+                    
+                if len(self.vertices_texcoords) > old_idx:
+                    new_uvs.append(self.vertices_texcoords[old_idx])
+                    
+                if len(self.vertices_normals) > old_idx:
+                    new_normals.append(self.vertices_normals[old_idx])
+                    
+                new_idx += 1
+        
+        # Update vertex arrays
+        self.vertices = new_vertices
+        self.vertices_colors = new_colors
+        self.vertices_texcoords = new_uvs
+        self.vertices_normals = new_normals
+        
+        # Update all indices
+        for i in range(len(self.indices)):
+            self.indices[i] = old_to_new[self.indices[i]]
+            
+        for i in range(len(self.indices_normals)):
+            if self.indices_normals[i] in old_to_new:
+                self.indices_normals[i] = old_to_new[self.indices_normals[i]]
+                
+        for i in range(len(self.indices_texcoords)):
+            if self.indices_texcoords[i] in old_to_new:
+                self.indices_texcoords[i] = old_to_new[self.indices_texcoords[i]]
+
+    def removeDegenerateTriangles(self):
+        """Remove triangles that have duplicate vertices (degenerate triangles)."""
+        if len(self.indices) == 0:
+            return
+            
+        print("Removing degenerate triangles...")
+        initial_faces = self.totalFaces()
+        
+        # Find degenerate triangles
+        faces_to_remove = []
+        
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1]
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            # Check if any vertices are the same (degenerate triangle)
+            if i0 == i1 or i1 == i2 or i2 == i0:
+                faces_to_remove.append(face_idx)
+                continue
+                
+            # Check if triangle has zero area (vertices are collinear)
+            if len(self.vertices) > max(i0, i1, i2):
+                v0 = self.vertices[i0]
+                v1 = self.vertices[i1]
+                v2 = self.vertices[i2]
+                
+                # Calculate cross product to find area
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                cross = np.cross(edge1, edge2)
+                area = np.linalg.norm(cross) * 0.5
+                
+                # Remove triangles with extremely small area
+                if area < 1e-12:
+                    faces_to_remove.append(face_idx)
+        
+        # Remove degenerate faces in reverse order
+        for face_idx in sorted(faces_to_remove, reverse=True):
+            start_idx = face_idx * 3
+            # Remove triangle indices
+            del self.indices[start_idx:start_idx + 3]
+            
+            # Remove corresponding normal and texture indices
+            if len(self.indices_normals) > start_idx:
+                del self.indices_normals[start_idx + 2]
+            if len(self.indices_texcoords) > start_idx:
+                del self.indices_texcoords[start_idx + 2]
+        
+        final_faces = self.totalFaces()
+        removed_count = initial_faces - final_faces
+        
+        if removed_count > 0:
+            print(f"  Removed {removed_count} degenerate triangles")
+        else:
+            print("  No degenerate triangles found")
+    
+    def validateMesh(self):
+        """Validate mesh integrity and report any issues."""
+        print("Validating mesh integrity...")
+        issues = []
+        
+        # Check for out-of-bounds vertex indices
+        max_vertex_idx = len(self.vertices) - 1
+        for i, idx in enumerate(self.indices):
+            if idx < 0 or idx > max_vertex_idx:
+                issues.append(f"Face {i//3} has out-of-bounds vertex index {idx} (max: {max_vertex_idx})")
+        
+        # Check for degenerate triangles
+        degenerate_count = 0
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1]
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            if i0 == i1 or i1 == i2 or i2 == i0:
+                issues.append(f"Face {face_idx} is degenerate (duplicate vertices): [{i0}, {i1}, {i2}]")
+                degenerate_count += 1
+        
+        # Check for zero-area triangles
+        zero_area_count = 0
+        for face_idx in range(self.totalFaces()):
+            i0 = self.indices[face_idx * 3]
+            i1 = self.indices[face_idx * 3 + 1]
+            i2 = self.indices[face_idx * 3 + 2]
+            
+            if max(i0, i1, i2) < len(self.vertices):
+                v0 = self.vertices[i0]
+                v1 = self.vertices[i1]
+                v2 = self.vertices[i2]
+                
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                cross = np.cross(edge1, edge2)
+                area = np.linalg.norm(cross) * 0.5
+                
+                if area < 1e-12:
+                    zero_area_count += 1
+        
+        # Check vertex attribute consistency
+        vertex_count = len(self.vertices)
+        color_count = len(self.vertices_colors)
+        uv_count = len(self.vertices_texcoords)
+        normal_count = len(self.vertices_normals)
+        
+        if color_count > 0 and color_count != vertex_count:
+            issues.append(f"Color count mismatch: {color_count} colors for {vertex_count} vertices")
+        
+        if uv_count > 0 and uv_count != vertex_count:
+            issues.append(f"UV count mismatch: {uv_count} UVs for {vertex_count} vertices")
+        
+        if normal_count > 0 and normal_count != vertex_count:
+            issues.append(f"Normal count mismatch: {normal_count} normals for {vertex_count} vertices")
+        
+        # Report results
+        if not issues:
+            print("✓ Mesh validation passed - no issues found")
+        else:
+            print(f"✗ Mesh validation found {len(issues)} issues:")
+            for issue in issues[:10]:  # Show first 10 issues
+                print(f"  - {issue}")
+            if len(issues) > 10:
+                print(f"  ... and {len(issues) - 10} more issues")
+                
+        if degenerate_count > 0:
+            print(f"  Summary: {degenerate_count} degenerate triangles")
+        if zero_area_count > 0:
+            print(f"  Summary: {zero_area_count} zero-area triangles")
+        
+        return len(issues) == 0
 
