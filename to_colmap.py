@@ -32,6 +32,7 @@ from utils.mesh import Mesh
 import PIL.Image as pil_image
 import cv2
 from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs, unwarp_texture
+from utils.colmap import read_model
 
 # Set device and dtype
 
@@ -432,7 +433,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
         # Save aggregated mask mesh
         agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
-
+        agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
 
 
     print("Converting to COLMAP format")
@@ -459,6 +460,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     sparse_reconstruction_dir = os.path.join(scene_dir, "sparse")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
     reconstruction.write(sparse_reconstruction_dir)
+    # reconstruction.write_text(sparse_reconstruction_dir)
 
     # Save point cloud for fast visualization
     point_cloud = Mesh()
@@ -505,6 +507,65 @@ def rename_colmap_recons_and_rescale_camera(
     return reconstruction
 
 
+def colmap_to_csv(scene_dir, output_csv):
+    sparse_folder = os.path.join(scene_dir, "sparse")
+    rgba_folder = os.path.join(scene_dir, "images")
+    expected_N = len(os.listdir(rgba_folder))
+
+    if os.path.exists(os.path.join(sparse_folder, "0")):
+        sparse_folder = os.path.join(sparse_folder, "0")
+
+    cameras, model_images, points3D = read_model(path=sparse_folder)
+
+    keys = list(model_images.keys())
+    keys = sorted(keys, key=lambda x: model_images[x].name)
+
+    print(len(keys))
+    if expected_N is not None:
+        assert len(keys) == expected_N
+
+    camkey = model_images[keys[0]].camera_id
+    # for key in keys:
+    #     print(model_images[key].camera_id)
+        # assume single camera setup since we are dealing with videos
+        # assert model_images[key].camera_id == camkey
+
+    cam = cameras[camkey]
+    params = cam.params
+
+    model = cam.model
+    width = params[0]
+    height = params[1]
+
+    focal_length = None
+    principal_point = None
+    if cam.model == "SIMPLE_PINHOLE":
+        focal_length = params[0]
+        principal_point = params[:2].tolist()
+    elif cam.model == "PINHOLE":
+        focal_length = params[0]
+        principal_point = params[:2].tolist()
+    field_of_view = 2 * np.arctan(0.5 * params[1] / focal_length) * 180 / np.pi
+
+    # assert cam.model in ["RADIAL", "SIMPLE_RADIAL"]
+    K = np.array([[params[0], 0.0, params[1]],
+                  [0.0, params[0], params[2]],
+                  [0.0,       0.0,       1.0]])
+
+    Rs = np.stack([model_images[k].qvec2rotmat() for k in keys])
+    ts = np.stack([model_images[k].tvec for k in keys])
+
+    N = Rs.shape[0]
+    params = params[:3][None].repeat(N, axis=0)
+    Rs = Rs.reshape(N, 9)
+
+    lines = np.concatenate((params, Rs, ts), axis=1)
+
+    np.savetxt(output_csv, lines, delimiter=",", newline="\n",
+               header=(",".join(["f", "ox", "oy"]+
+                                [f"R[{i//3},{i%3}]" for i in range(9)]+
+                                [f"t[{i}]" for i in range(3)])))
+  
 if __name__ == "__main__":
     args = parse_args()
     with torch.no_grad():
@@ -519,6 +580,7 @@ if __name__ == "__main__":
         print(f"Setting seed as: {args.seed}")
 
         to_colmap(args.scene_dir, args.confidence_threshold)
+        colmap_to_csv(args.scene_dir, os.path.join(args.scene_dir, "cameras.csv"))
 
 
 # Work in Progress (WIP)
