@@ -38,6 +38,14 @@ from utils.colmap import read_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+faces = nodes_faces()
+uvs = nodes_uvs()
+
+agregate_masks_node_positions = []
+agregate_masks_node_colors = []
+agregate_masks_normalized_weights = []
+agregate_masks_texture = []
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run VGGT with a COLMAP scene bundle conversion")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
@@ -46,6 +54,7 @@ def parse_args():
     parser.add_argument("--export_depth", action="store_true", default=False, help="Whether to export depth maps")
     parser.add_argument("--export_mask_texture", action="store_true", default=False, help="Whether to export mask texture maps")
     parser.add_argument("--subdivide_mask", type=int, default=0, help="Amount of times to subdivide the mask mesh")
+    parser.add_argument("--replace_folder", type=str, default=None, help="Folder to replace existing images")
     return parser.parse_args()
 
 
@@ -122,7 +131,7 @@ def get_image_path_list(scene_dir):
     return image_path_list
 
 
-def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolution: int = 518, img_load_resolution: int = 1024, max_points_for_colmap: int = 100000):
+def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolution: int = 518, img_load_resolution: int = 1024, max_points_for_colmap: int = 512*512):
     image_path_list = get_image_path_list(scene_dir)
 
     # Load images as 1024x1024 square images, while preserving original coordinates
@@ -171,13 +180,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
     mask_dir = os.path.join(scene_dir, "masks")
     os.makedirs(mask_dir, exist_ok=True)
-    faces = nodes_faces()
-    uvs = nodes_uvs()
 
-    agregate_masks_node_positions = []
-    agregate_masks_node_colors = []
-    agregate_masks_normalized_weights = []
-    agregate_masks_texture = []
 
     for i, depth in enumerate(depth_map):
         image_path = image_path_list[i]
@@ -185,6 +188,8 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
         # place depth in original image size
         orig_h, orig_w = original_coords[i, -2:].cpu().numpy().astype(int)
 
+        image_path = image_path_list[i]
+        
         img = cv2.cvtColor(cv2.imread(image_path_list[i]), cv2.COLOR_BGR2RGB) 
         mask_nodes = image_to_nodes(img)
         if mask_nodes is not None:
@@ -267,29 +272,23 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
 
         if args.export_depth:
-            depth = depth.copy()
-            # filter depth with confidence mask
-            depth[~conf_mask_original[i]] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
-
-            # calculate the scale factor used to resize original image to square image
-            scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
-            # calculate the padding added to the original image to make it square
-            # after resizing, the padding should also be scaled
-            pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
-            pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
-
-            depth = depth[pad_w: pad_w + int(orig_w * scale_factor), pad_h: pad_h + int(orig_h * scale_factor)]
-            
-            # normalize depth for visualization
-            depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
-            depth_img = np.clip(depth_img, 0.0, 1.0)
-            depth_img = (depth_img * 255.0).astype(np.uint8)
-            depth_img = np.repeat(depth_img, 3, axis=-1)
-            depth_img = pil_image.fromarray(depth_img)
-
             basename = os.path.basename(image_path)
             basename = os.path.splitext(basename)[0]
-            depth_img.save(os.path.join(depth_dir, f"{basename}.png"))
+            depth_path = os.path.join(depth_dir, f"{basename}.png")
+            save_depthmaps(depth.copy(), min_depth, max_depth, conf_mask_original[i], depth_path, (orig_h, orig_w), vggt_fixed_resolution)
+
+    if args.replace_folder:
+        # reload points_rgb with images from the replace folder that match the base name (not the extension)
+        replace_image_paths = glob.glob(os.path.join(args.replace_folder, "*"))
+        replace_image_dict = {os.path.splitext(os.path.basename(p))[0]: p for p in replace_image_paths}
+        for i, image_path in enumerate(image_path_list):
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            if base_name in replace_image_dict:
+                replace_img = cv2.cvtColor(cv2.imread(replace_image_dict[base_name]), cv2.COLOR_BGR2RGB)
+                replace_img = cv2.resize(replace_img, (vggt_fixed_resolution, vggt_fixed_resolution))
+                points_rgb[i] = replace_img
+                print(f"Replaced colors for {base_name} from {replace_image_dict[base_name]}")
+
 
 
     # filter points
@@ -297,143 +296,23 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     points_xyf = points_xyf[conf_mask]
     points_rgb = points_rgb[conf_mask]
 
-    # Initialize best mask points and colors
-    best_mask_world_points = []
-    best_mask_colors = []
-    if len(agregate_masks_node_positions) == 1:
-        best_mask_world_points = agregate_masks_node_positions[0]
-        best_mask_colors = agregate_masks_node_colors[0]
+    # Agregate mask textures
+    if args.export_mask_texture and len(agregate_masks_texture) > 0:
+        averaged_texture = agregate_mask_texture(agregate_masks_texture)
+        texture_path = os.path.join(scene_dir, "mask_texture.png")
+        cv2.imwrite(texture_path, cv2.cvtColor(averaged_texture, cv2.COLOR_RGBA2BGRA))
+        print(f"Saved aggregated mask texture to {texture_path}")
 
-    elif len(agregate_masks_node_positions) > 1:
-        
-        #  convert agregate_masks_node_positions to numpy array
-        agregate_masks_node_positions = np.array(agregate_masks_node_positions)  # (N_images, N_landmarks, 3)
-        agregate_masks_normalized_weights = np.array(agregate_masks_normalized_weights)  # (N_images, N_landmarks)
-
-        # return the image index number with highest normalize weight for each landmark
-        best_image_indices = np.argmax(agregate_masks_normalized_weights, axis=0)
-        best_masks_normalized_weights = agregate_masks_normalized_weights[best_image_indices, np.arange(len(best_image_indices))]
-
-        #  Average the position of each node so the higher the weight the more it influences the final position BUT first filter very low weights
-        for landmark_idx in range(agregate_masks_node_positions.shape[1]):
-            weights = agregate_masks_normalized_weights[:, landmark_idx]
-            positions = agregate_masks_node_positions[:, landmark_idx, :]
-
-            # filter very low weights
-            weight_threshold = (args.confidence_threshold - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
-            valid = weights >= weight_threshold
-            if np.sum(valid) == 0:
-                # if no valid weights, just take the position from the image with highest weight
-                best_image_idx = np.argmax(weights)
-                best_mask_world_points.append(positions[best_image_idx])
-                best_mask_colors.append(agregate_masks_node_colors[best_image_idx][landmark_idx])
-            else:
-                weights = weights[valid]
-                positions = positions[valid]
-                weighted_position = np.average(positions, axis=0, weights=weights)
-                best_mask_world_points.append(weighted_position)
-                # also average colors
-                colors = np.array(agregate_masks_node_colors)[valid, landmark_idx, :]
-                weighted_color = np.average(colors, axis=0, weights=weights)
-                best_mask_colors.append(weighted_color)
-
-        best_mask_world_points = np.array(best_mask_world_points)
-        best_mask_colors = np.array(best_mask_colors).astype(np.uint8)
-
-        # filter those points with very low weights
-        weight_threshold = (args.confidence_threshold - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
-        # weight_threshold = 0.1; #max(0.1, weight_threshold)  # at least 0.1
-        weight_mask = best_masks_normalized_weights >= weight_threshold
-
-        # filter the best mask world points
-        filtered_mask_world_points = best_mask_world_points[weight_mask]
-
-        filtered_mask_colors = best_mask_colors[weight_mask]
-
-        # reorganize faces and uvs based on the weight mask
-        old_to_new_idx = np.full(len(best_mask_world_points), -1, dtype=int)
-        old_to_new_idx[weight_mask] = np.arange(np.sum(weight_mask))
-
-        # Filter faces - keep only faces where ALL vertices are in the confident set
-        valid_faces = []
-        for face in faces:
-            # Check if all vertices in this face are in the confident set
-            if all(weight_mask[v] for v in face if v < len(weight_mask)):
-                # Remap vertex indices to new filtered array
-                new_face = [old_to_new_idx[v] for v in face if v < len(weight_mask)]
-                if all(idx >= 0 for idx in new_face):  # All vertices successfully mapped
-                    valid_faces.append(new_face)
-        
-        faces_filtered = np.array(valid_faces) if valid_faces else np.empty((0, 3), dtype=int)
-        uvs_filtered = uvs[weight_mask] if len(uvs) == len(best_mask_world_points) else uvs[:len(filtered_mask_world_points)]
-
-        # update filtered_mask_world_points and filtered_mask_colors
-        if args.export_mask_texture and len(agregate_masks_texture) > 0:
-            # all textures have the same size and an alpha channel,
-            # average all pixels with alpha > 0 together 
-            # any value with alpha > 0 is considered valid
-            
-            texture_size = agregate_masks_texture[0].shape[:2]
-            aggregated_texture = np.zeros((texture_size[0], texture_size[1], 4), dtype=np.float32)
-            count_texture = np.zeros((texture_size[0], texture_size[1]), dtype=np.float32)
-
-            for texture in agregate_masks_texture:
-                alpha_mask = texture[:, :, 3] > 0
-                aggregated_texture[alpha_mask] += texture[alpha_mask]
-                count_texture[alpha_mask] += 1.0
-
-            # Avoid division by zero
-            count_texture[count_texture == 0] = 1.0
-            averaged_texture = (aggregated_texture / count_texture[:, :, None]).astype(np.uint8)
-
-            # if the alpha is > 0 set alpha to 255
-            averaged_texture[averaged_texture[:, :, 3] > 0, 3] = 255
-
-            texture_path = os.path.join(scene_dir, "mask_texture.png")
-            cv2.imwrite(texture_path, cv2.cvtColor(averaged_texture, cv2.COLOR_RGBA2BGRA))
-            print(f"Saved aggregated mask texture to {texture_path}")
-
-        # Only create mesh if we have enough confident landmarks and faces
-        agregated_mask_mesh = Mesh()
-        agregated_mask_mesh.addVertices(filtered_mask_world_points)
-        agregated_mask_mesh.addTexCoords(uvs_filtered)
-        agregated_mask_mesh.addTriangles(faces_filtered)
-        agregated_mask_mesh.addColors(filtered_mask_colors)
-        # agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
-
-        if args.subdivide_mask > 0:
-            # subdivide mesh at each vertex of points_3d and points_rgb (with threshold=0.01)
-            total_points = len(points_3d)
-            indices = np.arange(total_points)
-
-            # mix the indices
-            np.random.shuffle(indices)
-
-            # add tqdm progress bar
-            counter = 0
-            with tqdm.tqdm(total=args.subdivide_mask) as pbar:
-                for i in indices:
-                    point = points_3d[i]
-                    color = points_rgb[i]
-
-                    rta = agregated_mask_mesh.subdivideAt(point, color=color, threshold=0.01)
-
-                    if len(rta) > 0:
-                        counter += 1
-                        pbar.update(1)
-
-                    if i >= total_points or counter >= total_points or counter >= args.subdivide_mask:
-                        break
-
-                if counter % 10 == 0:
-                    agregated_mask_mesh.isotropicRemesh(max_iterations=1)
-
-        # smooth normals
-        agregated_mask_mesh.smoothNormals()
-
-        # Save aggregated mask mesh
-        agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
-        agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
+    # Agregate mask mesh
+    weight_threshold = (args.confidence_threshold - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
+    agregated_mask_mesh = agregate_mask_mesh(
+                            agregate_masks_node_positions, agregate_masks_node_colors, agregate_masks_normalized_weights,
+                            weight_threshold,
+                            faces, uvs, points_3d, points_rgb, 
+                            args.subdivide_mask
+                        )
+    agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
+    agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
 
 
     print("Converting to COLMAP format")
@@ -469,6 +348,168 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     point_cloud.toPly(os.path.join(scene_dir, "sparse/points.ply"))
 
     return True
+
+
+def agregate_mask_texture(agregate_masks_texture):
+    # all textures have the same size and an alpha channel,
+    # average all pixels with alpha > 0 together 
+    # any value with alpha > 0 is considered valid
+    
+    texture_size = agregate_masks_texture[0].shape[:2]
+    aggregated_texture = np.zeros((texture_size[0], texture_size[1], 4), dtype=np.float32)
+    count_texture = np.zeros((texture_size[0], texture_size[1]), dtype=np.float32)
+
+    for texture in agregate_masks_texture:
+        alpha_mask = texture[:, :, 3] > 0
+        aggregated_texture[alpha_mask] += texture[alpha_mask]
+        count_texture[alpha_mask] += 1.0
+
+    # Avoid division by zero
+    count_texture[count_texture == 0] = 1.0
+    averaged_texture = (aggregated_texture / count_texture[:, :, None]).astype(np.uint8)
+
+    # if the alpha is > 0 set alpha to 255
+    averaged_texture[averaged_texture[:, :, 3] > 0, 3] = 255
+    return averaged_texture
+
+
+def agregate_mask_mesh( agregate_masks_node_positions, agregate_masks_node_colors, agregate_masks_normalized_weights,
+                        weight_threshold,
+                        faces, uvs, points_3d, points_rgb, 
+                        subdivide_mask):
+
+     # Initialize best mask points and colors
+    best_mask_world_points = []
+    best_mask_colors = []
+    if len(agregate_masks_node_positions) == 1:
+        best_mask_world_points = agregate_masks_node_positions[0]
+        best_mask_colors = agregate_masks_node_colors[0]
+
+    elif len(agregate_masks_node_positions) > 1:
+        
+        #  convert agregate_masks_node_positions to numpy array
+        agregate_masks_node_positions = np.array(agregate_masks_node_positions)  # (N_images, N_landmarks, 3)
+        agregate_masks_normalized_weights = np.array(agregate_masks_normalized_weights)  # (N_images, N_landmarks)
+
+        # return the image index number with highest normalize weight for each landmark
+        best_image_indices = np.argmax(agregate_masks_normalized_weights, axis=0)
+        best_masks_normalized_weights = agregate_masks_normalized_weights[best_image_indices, np.arange(len(best_image_indices))]
+
+        #  Average the position of each node so the higher the weight the more it influences the final position BUT first filter very low weights
+        for landmark_idx in range(agregate_masks_node_positions.shape[1]):
+            weights = agregate_masks_normalized_weights[:, landmark_idx]
+            positions = agregate_masks_node_positions[:, landmark_idx, :]
+
+            # filter very low weights
+            valid = weights >= weight_threshold
+            if np.sum(valid) == 0:
+                # if no valid weights, just take the position from the image with highest weight
+                best_image_idx = np.argmax(weights)
+                best_mask_world_points.append(positions[best_image_idx])
+                best_mask_colors.append(agregate_masks_node_colors[best_image_idx][landmark_idx])
+            else:
+                weights = weights[valid]
+                positions = positions[valid]
+                weighted_position = np.average(positions, axis=0, weights=weights)
+                best_mask_world_points.append(weighted_position)
+                # also average colors
+                colors = np.array(agregate_masks_node_colors)[valid, landmark_idx, :]
+                weighted_color = np.average(colors, axis=0, weights=weights)
+                best_mask_colors.append(weighted_color)
+
+        best_mask_world_points = np.array(best_mask_world_points)
+        best_mask_colors = np.array(best_mask_colors).astype(np.uint8)
+
+        # filter those points with very low weights
+        weight_mask = best_masks_normalized_weights >= weight_threshold
+
+        # filter the best mask world points
+        filtered_mask_world_points = best_mask_world_points[weight_mask]
+
+        filtered_mask_colors = best_mask_colors[weight_mask]
+
+        # reorganize faces and uvs based on the weight mask
+        old_to_new_idx = np.full(len(best_mask_world_points), -1, dtype=int)
+        old_to_new_idx[weight_mask] = np.arange(np.sum(weight_mask))
+
+        # Filter faces - keep only faces where ALL vertices are in the confident set
+        valid_faces = []
+        for face in faces:
+            # Check if all vertices in this face are in the confident set
+            if all(weight_mask[v] for v in face if v < len(weight_mask)):
+                # Remap vertex indices to new filtered array
+                new_face = [old_to_new_idx[v] for v in face if v < len(weight_mask)]
+                if all(idx >= 0 for idx in new_face):  # All vertices successfully mapped
+                    valid_faces.append(new_face)
+        
+        faces_filtered = np.array(valid_faces) if valid_faces else np.empty((0, 3), dtype=int)
+        uvs_filtered = uvs[weight_mask] if len(uvs) == len(best_mask_world_points) else uvs[:len(filtered_mask_world_points)]
+
+        # Only create mesh if we have enough confident landmarks and faces
+        agregated_mask_mesh = Mesh()
+        agregated_mask_mesh.addVertices(filtered_mask_world_points)
+        agregated_mask_mesh.addTexCoords(uvs_filtered)
+        agregated_mask_mesh.addTriangles(faces_filtered)
+        agregated_mask_mesh.addColors(filtered_mask_colors)
+
+        if subdivide_mask > 0:
+            # subdivide mesh at each vertex of points_3d and points_rgb (with threshold=0.01)
+            total_points = len(points_3d)
+            indices = np.arange(total_points)
+
+            # mix the indices
+            np.random.shuffle(indices)
+
+            # add tqdm progress bar
+            counter = 0
+            with tqdm.tqdm(total=subdivide_mask) as pbar:
+                for i in indices:
+                    point = points_3d[i]
+                    color = points_rgb[i]
+
+                    rta = agregated_mask_mesh.subdivideAt(point, color=color, threshold=0.01)
+
+                    if len(rta) > 0:
+                        counter += 1
+                        pbar.update(1)
+
+                    if i >= total_points or counter >= total_points or counter >= subdivide_mask:
+                        break
+
+                if counter % 10 == 0:
+                    agregated_mask_mesh.isotropicRemesh(max_iterations=1)
+
+        # smooth normals
+        agregated_mask_mesh.smoothNormals()
+
+        return agregated_mask_mesh
+
+
+
+def save_depthmaps(depth, min_depth, max_depth, conf_mask_original, depth_path, orig_size, vggt_fixed_resolution):
+    orig_h, orig_w = orig_size
+
+    # filter depth with confidence mask
+    depth[~conf_mask_original] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
+
+    # calculate the scale factor used to resize original image to square image
+    scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
+    # calculate the padding added to the original image to make it square
+    # after resizing, the padding should also be scaled
+    pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
+    pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+
+    depth = depth[pad_w: pad_w + int(orig_w * scale_factor), pad_h: pad_h + int(orig_h * scale_factor)]
+    
+    # normalize depth for visualization
+    depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
+    depth_img = np.clip(depth_img, 0.0, 1.0)
+    depth_img = (depth_img * 255.0).astype(np.uint8)
+    depth_img = np.repeat(depth_img, 3, axis=-1)
+    depth_img = pil_image.fromarray(depth_img)
+
+    depth_img.save(depth_path)
+
 
 
 def rename_colmap_recons_and_rescale_camera(
