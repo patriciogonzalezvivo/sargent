@@ -38,13 +38,6 @@ from utils.colmap import read_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-faces = nodes_faces()
-uvs = nodes_uvs()
-
-agregate_masks_node_positions = []
-agregate_masks_node_colors = []
-agregate_masks_normalized_weights = []
-agregate_masks_texture = []
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run VGGT with a COLMAP scene bundle conversion")
@@ -181,6 +174,13 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     mask_dir = os.path.join(scene_dir, "masks")
     os.makedirs(mask_dir, exist_ok=True)
 
+    faces = nodes_faces()
+    uvs = nodes_uvs()
+
+    agregate_masks_node_positions = []
+    agregate_masks_node_colors = []
+    agregate_masks_normalized_weights = []
+    agregate_masks_texture = []
 
     for i, depth in enumerate(depth_map):
         image_path = image_path_list[i]
@@ -195,58 +195,16 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
         if mask_nodes is not None:
             mask_obj_path = os.path.join(mask_dir, f"{os.path.basename(image_path_list[i]).split('.')[0]}.obj")
 
-            # Get original image dimensions for coordinate transformation
-            top_left = original_coords[i, :2].cpu().numpy()  # padding offset in processed image
-            scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)  # scale used to resize to 518x518
-            
-            # Convert normalized MediaPipe coordinates to VGGT image coordinates (518x518)
-            # MediaPipe x,y are normalized [0,1], so scale to image dimensions
-            mask_nodes_image = mask_nodes.copy()
-            mask_nodes_image[:, 0] *= orig_w * scale_factor  # scale x to resized image width
-            mask_nodes_image[:, 1] *= orig_h * scale_factor  # scale y to resized image height
-            
-            # Add padding offset to account for centering in 518x518 square
-            pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
-            pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
-            mask_nodes_image[:, 0] += pad_w
-            mask_nodes_image[:, 1] += pad_h
-            
-            # Sample depth from VGGT depth map at face landmark positions
-            # Clamp coordinates to valid range
-            u_coords = np.clip(mask_nodes_image[:, 0].astype(int), 0, vggt_fixed_resolution - 1)
-            v_coords = np.clip(mask_nodes_image[:, 1].astype(int), 0, vggt_fixed_resolution - 1)
-            
-            # Get depth values from VGGT depth map
-            sampled_depths = depth[v_coords, u_coords]
-            
-            # Replace MediaPipe z with VGGT depth for consistent scale
-            # Ensure sampled_depths is 1D array to match the slice shape
-            if sampled_depths.ndim > 1:
-                sampled_depths = sampled_depths.flatten()
-            mask_nodes_image[:, 2] = sampled_depths
-            
-            # Transform from image coordinates to camera coordinates using intrinsics
-            fx, fy = intrinsic[i, 0, 0], intrinsic[i, 1, 1]
-            cx, cy = intrinsic[i, 0, 2], intrinsic[i, 1, 2]
-            
-            # Unproject to 3D camera coordinates
-            mask_nodes_camera = np.zeros_like(mask_nodes_image)
-            mask_nodes_camera[:, 0] = (mask_nodes_image[:, 0] - cx) * mask_nodes_image[:, 2] / fx
-            mask_nodes_camera[:, 1] = (mask_nodes_image[:, 1] - cy) * mask_nodes_image[:, 2] / fy
-            mask_nodes_camera[:, 2] = mask_nodes_image[:, 2]
-            
-            # Transform from camera coordinates to world coordinates using extrinsics
-            # extrinsic transforms world to camera, so we need the inverse
-            R = extrinsic[i, :3, :3]
-            t = extrinsic[i, :3, 3]
-            
-            # Transform: world = R.T @ (camera - t)
-            # First subtract translation, then apply rotation transpose
-            mask_nodes_world = (R.T @ (mask_nodes_camera - t).T).T
+            mask_nodes_world, u_coords, v_coords = convert_from_orthographic_to_perspective(mask_nodes, (orig_w, orig_h), vggt_fixed_resolution, depth, intrinsic[i], extrinsic[i])
+            agregate_masks_node_positions.append(mask_nodes_world)
 
             # extract vertex colors from point_rgb
             mask_nodes_colors = points_rgb[i][v_coords, u_coords]
             agregate_masks_node_colors.append(mask_nodes_colors)
+
+            landmark_depth_confidence = depth_conf[i][v_coords, u_coords]
+            normalized_node_weights = (landmark_depth_confidence - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
+            agregate_masks_normalized_weights.append(normalized_node_weights)
 
             if args.export_mask_texture:
                 # Export texture map for the mask
@@ -262,15 +220,8 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
             mask.addColors(mask_nodes_colors)
             mask.smoothNormals()
             mask.toObj(mask_obj_path)
-
-            # Get confidence values at face landmark positions
-            landmark_depth_confidence = depth_conf[i][v_coords, u_coords]
-
-            agregate_masks_node_positions.append(mask_nodes_world)
-            normalized_node_weights = (landmark_depth_confidence - min_depth_confidence) / (max_depth_confidence - min_depth_confidence + 1e-8)
-            agregate_masks_normalized_weights.append(normalized_node_weights)
-
-
+            print(f"Saved mask mesh to {mask_obj_path}")
+            
         if args.export_depth:
             basename = os.path.basename(image_path)
             basename = os.path.splitext(basename)[0]
@@ -290,11 +241,16 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
                 print(f"Replaced colors for {base_name} from {replace_image_dict[base_name]}")
 
 
-
     # filter points
     points_3d = points_3d[conf_mask]
     points_xyf = points_xyf[conf_mask]
     points_rgb = points_rgb[conf_mask]
+
+    # calculate the center of the point cloud (points_3d)
+    points_center = np.mean(points_3d, axis=0)
+
+    # do a UV spherical projection of the points around the mask center
+    points_uvs = spherical_projection(points_3d - points_center)
 
     # Agregate mask textures
     if args.export_mask_texture and len(agregate_masks_texture) > 0:
@@ -313,6 +269,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
                         )
     agregated_mask_mesh.toObj(os.path.join(scene_dir, f"mask.obj"))
     agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
+    print(f"Saved aggregated mask mesh to {os.path.join(scene_dir, f'mask.obj')} and .ply")
 
 
     print("Converting to COLMAP format")
@@ -345,9 +302,113 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     point_cloud = Mesh()
     point_cloud.addVertices(points_3d)
     point_cloud.addColors(points_rgb)
+    point_cloud.addTexCoords(points_uvs)
     point_cloud.toPly(os.path.join(scene_dir, "sparse/points.ply"))
 
     return True
+
+
+def spherical_projection(points):
+    # points: (N, 3)
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    r = np.linalg.norm(points, axis=1) + 1e-8
+    theta = np.arccos(np.clip(z / r, -1.0, 1.0))  # polar angle
+    phi = np.arctan2(y, x)  # azimuthal angle
+
+    u = (phi + np.pi) / (2 * np.pi)  # normalize to [0, 1]
+    v = theta / np.pi  # normalize to [0, 1]
+
+    uvs = np.stack([u, v], axis=1)
+    return uvs
+
+
+def convert_from_orthographic_to_perspective(mask_nodes, orig_size, vggt_fixed_resolution, 
+                                             depth, intrinsic, extrinsic):
+    orig_w, orig_h = orig_size
+    scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
+
+    # Convert 2D mask nodes from orthographic to perspective projection
+    # This is a placeholder function and needs to be implemented
+
+    # MediaPipe landmarks are in normalized coordinates [0,1] with orthographic projection
+    # We need to convert them to perspective projection in VGGT camera space
+    
+    # First, convert normalized MediaPipe coordinates to original image pixel coordinates
+    mask_nodes_pixel = mask_nodes.copy()
+    mask_nodes_pixel[:, 0] *= orig_w  # scale x to original image width
+    mask_nodes_pixel[:, 1] *= orig_h  # scale y to original image height
+    
+    # MediaPipe z is in relative depth units, we need to scale it to match VGGT depth scale
+    # For now, we'll sample VGGT depth at the 2D landmark positions
+    
+    # Convert original image coordinates to VGGT processing coordinates (518x518)
+    mask_nodes_vggt = mask_nodes_pixel.copy()
+    mask_nodes_vggt[:, 0] *= scale_factor  # scale x to resized image width  
+    mask_nodes_vggt[:, 1] *= scale_factor  # scale y to resized image height
+    
+    # Add padding offset to account for centering in 518x518 square
+    pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
+    pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
+    mask_nodes_vggt[:, 0] += pad_w
+    mask_nodes_vggt[:, 1] += pad_h
+    
+    # Sample depth from VGGT depth map at face landmark positions
+    # Clamp coordinates to valid range
+    u_coords = np.clip(mask_nodes_vggt[:, 0].astype(int), 0, vggt_fixed_resolution - 1)
+    v_coords = np.clip(mask_nodes_vggt[:, 1].astype(int), 0, vggt_fixed_resolution - 1)
+    
+    # Get depth values from VGGT depth map
+    sampled_depths = depth[v_coords, u_coords]
+    
+    # Ensure sampled_depths is 1D array to match the slice shape
+    if sampled_depths.ndim > 1:
+        sampled_depths = sampled_depths.flatten()
+    
+    # Now we have the correct depth scale from VGGT, but we need to properly handle
+    # the orthographic to perspective conversion
+    
+    # MediaPipe provides orthographic projection, so we need to convert to perspective
+    # The key insight: MediaPipe landmarks represent normalized face coordinates
+    # We need to project them onto the depth plane determined by VGGT
+    
+    # Use VGGT camera parameters to unproject the 2D landmarks to 3D
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    
+    # Unproject VGGT image coordinates to 3D camera coordinates
+    mask_nodes_camera = np.zeros_like(mask_nodes_vggt)
+    mask_nodes_camera[:, 0] = (mask_nodes_vggt[:, 0] - cx) * sampled_depths / fx
+    mask_nodes_camera[:, 1] = (mask_nodes_vggt[:, 1] - cy) * sampled_depths / fy
+    mask_nodes_camera[:, 2] = sampled_depths
+    
+    # However, we need to account for the fact that MediaPipe landmarks have relative
+    # positioning that may not exactly match the perspective projection
+    # Apply a correction based on MediaPipe's orthographic nature
+    
+    # Get the median depth to use as reference depth plane
+    median_depth = np.median(sampled_depths)
+    
+    # MediaPipe landmarks are relative to face center, so we need to adjust
+    # the x,y coordinates based on the relative MediaPipe z-coordinate
+    for j in range(len(mask_nodes)):
+        # MediaPipe z represents relative depth from face plane
+        # Scale the x,y displacement based on this relative depth
+        relative_z = mask_nodes[j, 2]  # MediaPipe relative z
+        depth_scale = 1.0 + (relative_z - 0.5) * 0.1  # Subtle depth-based scaling
+        
+        # Apply depth-based correction to the unprojected coordinates
+        mask_nodes_camera[j, 0] *= depth_scale
+        mask_nodes_camera[j, 1] *= depth_scale
+    
+    # Transform from camera coordinates to world coordinates using extrinsics
+    # extrinsic transforms world to camera, so we need the inverse
+    R = extrinsic[:3, :3]
+    t = extrinsic[:3, 3]
+    
+    # Transform: world = R.T @ (camera - t)
+    # First subtract translation, then apply rotation transpose
+    mask_nodes_world = (R.T @ (mask_nodes_camera - t).T).T
+    return mask_nodes_world, u_coords, v_coords
 
 
 def agregate_mask_texture(agregate_masks_texture):
@@ -485,7 +546,6 @@ def agregate_mask_mesh( agregate_masks_node_positions, agregate_masks_node_color
         return agregated_mask_mesh
 
 
-
 def save_depthmaps(depth, min_depth, max_depth, conf_mask_original, depth_path, orig_size, vggt_fixed_resolution):
     orig_h, orig_w = orig_size
 
@@ -509,7 +569,6 @@ def save_depthmaps(depth, min_depth, max_depth, conf_mask_original, depth_path, 
     depth_img = pil_image.fromarray(depth_img)
 
     depth_img.save(depth_path)
-
 
 
 def rename_colmap_recons_and_rescale_camera(
@@ -561,15 +620,10 @@ def colmap_to_csv(scene_dir, output_csv):
     keys = list(model_images.keys())
     keys = sorted(keys, key=lambda x: model_images[x].name)
 
-    print(len(keys))
     if expected_N is not None:
         assert len(keys) == expected_N
 
     camkey = model_images[keys[0]].camera_id
-    # for key in keys:
-    #     print(model_images[key].camera_id)
-        # assume single camera setup since we are dealing with videos
-        # assert model_images[key].camera_id == camkey
 
     cam = cameras[camkey]
     params = cam.params
