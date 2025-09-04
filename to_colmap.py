@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--export_mask_texture", action="store_true", default=False, help="Whether to export mask texture maps")
     parser.add_argument("--subdivide_mask", type=int, default=0, help="Amount of times to subdivide the mask mesh")
     parser.add_argument("--replace_folder", type=str, default=None, help="Folder to replace existing images")
+    parser.add_argument("--mesh_reconstruction", action="store_true", default=False, help="Whether to run mesh reconstruction with Open3D")
+    parser.add_argument("--export_pcl_as_texture", action="store_true", default=False, help="Whether to export point cloud as textured mesh")
     return parser.parse_args()
 
 
@@ -124,7 +126,7 @@ def get_image_path_list(scene_dir):
     return image_path_list
 
 
-def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolution: int = 518, img_load_resolution: int = 1024, max_points_for_colmap: int = 512*512):
+def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolution: int = 518, img_load_resolution: int = 1024, max_points_for_colmap: int = 512 * 512):
     image_path_list = get_image_path_list(scene_dir)
 
     # Load images as 1024x1024 square images, while preserving original coordinates
@@ -252,6 +254,58 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     # do a UV spherical projection of the points around the mask center
     points_uvs = spherical_projection(points_3d - points_center)
 
+    points_normals = None
+    # try to compute normals
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_3d)
+
+        # estimate normals
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(10)
+
+        # convert normals to numpy array
+        points_normals = np.asarray(pcd.normals)
+    except ImportError:
+        print("Open3D is not installed, skipping normal estimation.")
+
+    # if open3d is installed, use it to estimate normals and reconstruct mesh
+    if args.mesh_reconstruction:
+        print("Running mesh reconstruction with Open3D")
+        try:
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_3d)
+            pcd.colors = o3d.utility.Vector3dVector(points_rgb / 255.0)
+
+            # voxel downsample
+            pcd = pcd.voxel_down_sample(voxel_size=0.005)
+            pcd.remove_non_finite_points()
+            pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+            # estimate normals
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+            pcd.orient_normals_consistent_tangent_plane(10)
+
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)[0]
+
+            # smooth mesh surface
+            mesh = mesh.filter_smooth_simple(number_of_iterations=3)
+
+            # remove low density vertices
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_non_manifold_edges()
+            mesh.remove_unreferenced_vertices()
+
+            mesh.compute_vertex_normals()
+            o3d.io.write_triangle_mesh(os.path.join(scene_dir, "sparse/points_mesh.ply"), mesh)
+
+        except ImportError:
+            print("Open3D is not installed, skipping mesh reconstruction.")
+
     # Agregate mask textures
     if args.export_mask_texture and len(agregate_masks_texture) > 0:
         averaged_texture = agregate_mask_texture(agregate_masks_texture)
@@ -271,6 +325,91 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     agregated_mask_mesh.toPly(os.path.join(scene_dir, f"mask.ply"))
     print(f"Saved aggregated mask mesh to {os.path.join(scene_dir, f'mask.obj')} and .ply")
 
+    if args.export_pcl_as_texture:
+
+        texture_xyz_path = os.path.join(scene_dir, "sparse/points_xyz.png")
+        texture_xyz_32bit_path = os.path.join(scene_dir, "sparse/points_xyz.exr")
+        texture_rgb_path = os.path.join(scene_dir, "sparse/points_rgb.png")
+        texture_normals_path = os.path.join(scene_dir, "sparse/points_normals.png")
+
+        # calculate the bounding box of the point cloud
+        min_bound = points_3d.min(axis=0)
+        max_bound = points_3d.max(axis=0)
+        bbox = np.array([min_bound, max_bound])
+        print(f"Point cloud bounding box size: {max_bound - min_bound}")
+
+        # normalize their postions 
+        points_3d_normalized = (points_3d - min_bound) / (max_bound - min_bound + 1e-8)
+
+        texture_size = 512
+        texture_xyz = np.zeros((texture_size, texture_size, 4), dtype=np.uint16)
+        texture_xyz_32bit = np.zeros((texture_size, texture_size, 3), dtype=np.float32)
+        texture_rgb = np.zeros((texture_size, texture_size, 4), dtype=np.uint8)
+        texture_normals = np.zeros((texture_size, texture_size, 4), dtype=np.uint8)
+        points_uvs = np.zeros_like(points_uvs)
+
+        # create a new set of uvs that fit in the 512x512 texture 
+        for i in range(texture_size * texture_size):
+            u = (i % texture_size) / (texture_size - 1)
+            v = (i // texture_size) / (texture_size - 1)
+            points_uvs[i] = np.array([u, v])
+            if i >= points_3d_normalized.shape[0]:
+                break
+
+        # create a 2 512x512 texture and save their values as 16bit png where X is R, Y is G and Z is B and the color values
+        for i in range(points_3d_normalized.shape[0]):
+            u = int(points_uvs[i, 0] * 511)
+            v = int(points_uvs[i, 1] * 511)
+
+            texture_xyz[v, u, 0] = int(points_3d_normalized[i, 0] * 65535)
+            texture_xyz[v, u, 1] = int(points_3d_normalized[i, 1] * 65535)
+            texture_xyz[v, u, 2] = int(points_3d_normalized[i, 2] * 65535)
+            texture_xyz[v, u, 3] = 65535
+
+            texture_xyz_32bit[v, u, 0] = points_3d[i, 0]
+            texture_xyz_32bit[v, u, 1] = points_3d[i, 1]
+            texture_xyz_32bit[v, u, 2] = points_3d[i, 2]
+
+            if points_normals is not None:
+                texture_normals[v, u, 0] = int((points_normals[i, 0] * 0.5 + 0.5) * 255)
+                texture_normals[v, u, 1] = int((points_normals[i, 1] * 0.5 + 0.5) * 255)
+                texture_normals[v, u, 2] = int((points_normals[i, 2] * 0.5 + 0.5) * 255)
+                texture_normals[v, u, 3] = 255
+
+            texture_rgb[v, u, 0] = int(points_rgb[i, 0])
+            texture_rgb[v, u, 1] = int(points_rgb[i, 1])
+            texture_rgb[v, u, 2] = int(points_rgb[i, 2])
+            texture_rgb[v, u, 3] = 255
+
+            points_uvs[i, 0] = u
+            points_uvs[i, 1] = v
+        
+        cv2.imwrite(texture_xyz_path, cv2.cvtColor(texture_xyz, cv2.COLOR_RGBA2BGRA))
+        cv2.imwrite(texture_rgb_path, cv2.cvtColor(texture_rgb, cv2.COLOR_RGBA2BGRA))
+        if points_normals is not None:
+            cv2.imwrite(texture_normals_path, cv2.cvtColor(texture_normals, cv2.COLOR_RGBA2BGRA))
+        try:
+            import OpenEXR
+            import Imath
+
+            header = OpenEXR.Header(texture_size, texture_size)
+            header['channels'] = {
+                'R': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+                'G': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)),
+                'B': Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT))
+            }
+
+
+            exr_file = OpenEXR.OutputFile(texture_xyz_32bit_path, header)
+            exr_file.writePixels({
+                'R': texture_xyz_32bit[:, :, 0].astype(np.float32).tobytes(),
+                'G': texture_xyz_32bit[:, :, 1].astype(np.float32).tobytes(),
+                'B': texture_xyz_32bit[:, :, 2].astype(np.float32).tobytes()
+            })
+            exr_file.close()
+
+        except ImportError:
+            print("OpenEXR not installed, cannot save 32bit EXR texture")
 
     print("Converting to COLMAP format")
     reconstruction = batch_np_matrix_to_pycolmap_wo_track(

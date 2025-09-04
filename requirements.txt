@@ -10,5 +10,5 @@ safetensors
 mediapipe
 scikit-image
 Shapely
-trimesh
 pycolmap==3.10.0
+open3d
