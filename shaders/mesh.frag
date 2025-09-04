@@ -55,17 +55,19 @@ void main(void) {
 
 #if defined(BACKGROUND)
     color = texture2D(u_image, st);
-    // color.r = 1.0;
 
-#else
-    color = v_color;
+#else 
 
-#ifdef MODEL_VERTEX_TEXCOORD
-    // color.rg = v_texcoord;
     vec2 uv = v_texcoord;
     uv.y = 1.0 - uv.y;
     color = texture2D(u_tex0, uv);
-#endif
+
+// #ifdef MODEL_VERTEX_TEXCOORD
+//     // color.rg = v_texcoord;
+//     vec2 uv = v_texcoord;
+//     uv.y = 1.0 - uv.y;
+//     color = texture2D(u_tex0, uv);
+// #endif
 
 #endif
 

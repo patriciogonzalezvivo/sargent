@@ -1,7 +1,8 @@
-
 #ifdef GL_ES
 precision mediump float;
 #endif
+
+uniform sampler2D   u_image;
 
 uniform vec2    u_resolution;
 uniform vec2    u_mouse;
@@ -17,8 +18,11 @@ void main(void) {
     vec2 st = gl_FragCoord.xy * pixel;
     vec2 uv = v_texcoord;
 
+#if defined(BACKGROUND)
+    color = texture2D(u_image, st);
+#else
     color.rgb = v_color.rgb;
-    // color.rg = v_texcoord;
-    
+#endif
+
     gl_FragColor = color;
 }
