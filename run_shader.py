@@ -32,9 +32,15 @@ def run_shader(scene, shader, model):
     height = int(width / aspect_ratio)
 
     model_path = f"{scene}/sparse/points.ply"
-    if model != "points":
+    if model == "mesh":
         model_path = f"{scene}/{model}.obj"
         model_path += f" {scene}/{model}_texture.png"
+    elif model == "points_tex":
+        model_path = f"-e pcl_plane"
+
+    # Adding textrures for points rendering
+    if model in ["points", "points_tex"]:
+        model_path += f" --u_tex_xyz {scene}/sparse/points_xyz.exr --u_tex_rgb {scene}/sparse/points_rgb.png --u_tex_normals {scene}/sparse/points_normals.png"
 
     cmd = f"{GLSLVIEWER} shaders/{shader}.vert shaders/{shader}.frag {model_path} {scene}/cameras.csv --u_image {scene}/images -w {width} -h {height} {GLSLVIEWER_ARGS}"
     print(f"Running command: {cmd}")

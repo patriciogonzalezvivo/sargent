@@ -18,6 +18,7 @@ void main(void) {
     vec2 uv = v_texcoord;
 
     color.rgb = v_color.rgb;
+    // color.rg = v_texcoord;
     
     gl_FragColor = color;
 }
