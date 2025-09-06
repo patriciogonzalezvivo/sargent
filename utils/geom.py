@@ -1,23 +1,12 @@
 import os
-import glob
-import copy
 
 import numpy as np
 import cv2
-import PIL.Image as pil_image
 
 import tqdm
 
 from .mesh import Mesh
-from .colmap import read_model
 
-def get_image_path_list(scene_dir):
-    image_dir = os.path.join(scene_dir, "images")
-    image_path_list = glob.glob(os.path.join(image_dir, "*"))
-    if len(image_path_list) == 0:
-        raise ValueError(f"No images found in {image_dir}")
-    image_path_list = sorted(image_path_list)
-    return image_path_list
 
 def assign_uv(points_3d, texture_size=512):
     points_uvs = np.zeros_like(points_3d[:, :2])
@@ -49,7 +38,7 @@ def estimate_normals(points_3d):
     return None
 
 
-def export_mesh_reconstruction(scene_dir, points_3d, points_rgb):
+def mesh_reconstruction(scene_dir, points_3d, points_rgb):
     print("Running mesh reconstruction with Open3D")
     try:
         import open3d as o3d
@@ -85,7 +74,7 @@ def export_mesh_reconstruction(scene_dir, points_3d, points_rgb):
         print("Open3D is not installed, skipping mesh reconstruction.")
 
 
-def export_as_texture(scene_dir, texture_size, points_3d, points_rgb, points_uvs, points_normals=None):
+def pcl_to_textures(scene_dir, texture_size, points_3d, points_rgb, points_uvs, points_normals=None):
     texture_xyz_path = os.path.join(scene_dir, "sparse/points_xyz.png")
     texture_xyz_32bit_path = os.path.join(scene_dir, "sparse/points_xyz.exr")
     texture_rgb_path = os.path.join(scene_dir, "sparse/points_rgb.png")
@@ -250,29 +239,6 @@ def convert_from_orthographic_to_perspective(mask_nodes, orig_size, vggt_fixed_r
     return mask_nodes_world, u_coords, v_coords
 
 
-def agregate_mask_texture(agregate_masks_texture):
-    # all textures have the same size and an alpha channel,
-    # average all pixels with alpha > 0 together 
-    # any value with alpha > 0 is considered valid
-    
-    texture_size = agregate_masks_texture[0].shape[:2]
-    aggregated_texture = np.zeros((texture_size[0], texture_size[1], 4), dtype=np.float32)
-    count_texture = np.zeros((texture_size[0], texture_size[1]), dtype=np.float32)
-
-    for texture in agregate_masks_texture:
-        alpha_mask = texture[:, :, 3] > 0
-        aggregated_texture[alpha_mask] += texture[alpha_mask]
-        count_texture[alpha_mask] += 1.0
-
-    # Avoid division by zero
-    count_texture[count_texture == 0] = 1.0
-    averaged_texture = (aggregated_texture / count_texture[:, :, None]).astype(np.uint8)
-
-    # if the alpha is > 0 set alpha to 255
-    averaged_texture[averaged_texture[:, :, 3] > 0, 3] = 255
-    return averaged_texture
-
-
 def agregate_mask_mesh( agregate_masks_node_positions, agregate_masks_node_colors, agregate_masks_normalized_weights,
                         weight_threshold,
                         faces, uvs, points_3d, points_rgb, 
@@ -383,119 +349,3 @@ def agregate_mask_mesh( agregate_masks_node_positions, agregate_masks_node_color
         agregated_mask_mesh.smoothNormals()
 
         return agregated_mask_mesh
-
-
-def save_depthmaps(depth, min_depth, max_depth, conf_mask_original, depth_path, orig_size, vggt_fixed_resolution):
-    orig_h, orig_w = orig_size
-
-    # filter depth with confidence mask
-    depth[~conf_mask_original] = max_depth + 1.0  # set low-confidence depth to max_depth + 1
-
-    # calculate the scale factor used to resize original image to square image
-    scale_factor = vggt_fixed_resolution / max(orig_h, orig_w)
-    # calculate the padding added to the original image to make it square
-    # after resizing, the padding should also be scaled
-    pad_h = (vggt_fixed_resolution - int(orig_h * scale_factor)) // 2
-    pad_w = (vggt_fixed_resolution - int(orig_w * scale_factor)) // 2
-
-    depth = depth[pad_w: pad_w + int(orig_w * scale_factor), pad_h: pad_h + int(orig_h * scale_factor)]
-    
-    # normalize depth for visualization
-    depth_img = (1.0-(depth - min_depth) / (max_depth - min_depth))
-    depth_img = np.clip(depth_img, 0.0, 1.0)
-    depth_img = (depth_img * 255.0).astype(np.uint8)
-    depth_img = np.repeat(depth_img, 3, axis=-1)
-    depth_img = pil_image.fromarray(depth_img)
-
-    depth_img.save(depth_path)
-
-
-def rename_colmap_recons_and_rescale_camera(
-    reconstruction, image_paths, original_coords, img_size, shift_point2d_to_original_res=False
-):
-    rescale_camera = True
-
-    for pyimageid in reconstruction.images:
-        # Reshaped the padded&resized image to the original size
-        # Rename the images to the original names
-        pyimage = reconstruction.images[pyimageid]
-        pycamera = reconstruction.cameras[pyimage.camera_id]
-        pyimage.name = os.path.basename(image_paths[pyimageid - 1])
-
-        if rescale_camera:
-            # Rescale the camera parameters
-            pred_params = copy.deepcopy(pycamera.params)
-
-            real_image_size = original_coords[pyimageid - 1, -2:]
-            resize_ratio = max(real_image_size) / img_size
-            pred_params = pred_params * resize_ratio
-            real_pp = real_image_size / 2
-            pred_params[-2:] = real_pp  # center of the image
-
-            pycamera.params = pred_params
-            pycamera.width = real_image_size[0]
-            pycamera.height = real_image_size[1]
-
-        if shift_point2d_to_original_res:
-            # Also shift the point2D to original resolution
-            top_left = original_coords[pyimageid - 1, :2]
-
-            for point2D in pyimage.points2D:
-                point2D.xy = (point2D.xy - top_left) * resize_ratio
-
-    return reconstruction
-
-
-def colmap_to_csv(scene_dir, output_csv):
-    sparse_folder = os.path.join(scene_dir, "sparse")
-    rgba_folder = os.path.join(scene_dir, "images")
-    expected_N = len(os.listdir(rgba_folder))
-
-    if os.path.exists(os.path.join(sparse_folder, "0")):
-        sparse_folder = os.path.join(sparse_folder, "0")
-
-    cameras, model_images, points3D = read_model(path=sparse_folder)
-
-    keys = list(model_images.keys())
-    keys = sorted(keys, key=lambda x: model_images[x].name)
-
-    if expected_N is not None:
-        assert len(keys) == expected_N
-
-    camkey = model_images[keys[0]].camera_id
-
-    cam = cameras[camkey]
-    params = cam.params
-
-    model = cam.model
-    width = params[0]
-    height = params[1]
-
-    focal_length = None
-    principal_point = None
-    if cam.model == "SIMPLE_PINHOLE":
-        focal_length = params[0]
-        principal_point = params[:2].tolist()
-    elif cam.model == "PINHOLE":
-        focal_length = params[0]
-        principal_point = params[:2].tolist()
-    field_of_view = 2 * np.arctan(0.5 * params[1] / focal_length) * 180 / np.pi
-
-    # assert cam.model in ["RADIAL", "SIMPLE_RADIAL"]
-    K = np.array([[params[0], 0.0, params[1]],
-                  [0.0, params[0], params[2]],
-                  [0.0,       0.0,       1.0]])
-
-    Rs = np.stack([model_images[k].qvec2rotmat() for k in keys])
-    ts = np.stack([model_images[k].tvec for k in keys])
-
-    N = Rs.shape[0]
-    params = params[:3][None].repeat(N, axis=0)
-    Rs = Rs.reshape(N, 9)
-
-    lines = np.concatenate((params, Rs, ts), axis=1)
-
-    np.savetxt(output_csv, lines, delimiter=",", newline="\n",
-               header=(",".join(["f", "ox", "oy"]+
-                                [f"R[{i//3},{i%3}]" for i in range(9)]+
-                                [f"t[{i}]" for i in range(3)])))

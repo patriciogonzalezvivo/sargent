@@ -31,7 +31,7 @@ def parse_args():
                         help='the path to the directory with the input data for validation.')
     parser.add_argument('--output',
                         type=str,
-                        default='results',
+                        default='edges',
                         help='the path to output the results.')
 
     parser.add_argument('--up_scale',
@@ -201,7 +201,7 @@ def image_to_edge(input_image, mean_bgr=[104.007, 116.669, 122.679, 137.86], res
     return fuse
 
 
-def run(input_image_path, output_image_path, args):
+def to_edges(input_image_path, output_image_path, args):
 
     # prepare paths and parameters
     output_filename = output_image_path.split('.')[0]
@@ -299,10 +299,10 @@ if __name__ == '__main__':
             if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
                 input_image_path = os.path.join(args.input, filename)
                 output_image_path = os.path.join(args.output, os.path.splitext(filename)[0] + '.png')
-                run(input_image_path=input_image_path,
+                to_edges(input_image_path=input_image_path,
                     output_image_path=output_image_path,
                     args=args)
     else:
-        run(input_image_path=args.input,
+        to_edges(input_image_path=args.input,
             output_image_path=args.output,
             args=args)

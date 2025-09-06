@@ -84,6 +84,10 @@ class Mesh:
         else:
             self.vertices_normals.append( np.array(vn) )
 
+    def addNormals( self, normals ):
+        for vn in normals:
+            self.addNormal( vn )
+
     def addNormalIndex( self, index ):
         self.indices_normals.append( index )
 

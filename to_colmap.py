@@ -11,6 +11,7 @@ import os
 
 import argparse
 
+import cv2
 import torch
 import torch.nn.functional as F
 
@@ -19,7 +20,6 @@ torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
-from utils.common import get_image_path_list, save_depthmaps, rename_colmap_recons_and_rescale_camera, convert_from_orthographic_to_perspective, assign_uv, estimate_normals, export_as_texture, export_mesh_reconstruction, agregate_mask_mesh, agregate_mask_texture, colmap_to_csv
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -27,10 +27,12 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 
+from utils.fs import get_image_path_list
 from utils.mesh import Mesh
-import cv2
+from utils.imag import save_depthmaps, average_images
+from utils.geom import convert_from_orthographic_to_perspective, assign_uv, estimate_normals, pcl_to_textures, mesh_reconstruction, agregate_mask_mesh
+from utils.scene import colmap_to_csv, rename_colmap_recons_and_rescale_camera
 from utils.face_tracker import image_to_nodes, nodes_faces, nodes_uvs, unwarp_texture
-
 
 # Set device and dtype
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -242,11 +244,11 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
 
     # if open3d is installed, use it to estimate normals and reconstruct mesh
     if args.mesh_reconstruction:
-        export_mesh_reconstruction(scene_dir, points_3d, points_rgb)
+        mesh_reconstruction(scene_dir, points_3d, points_rgb)
         
     # Agregate mask textures
     if args.export_mask_texture and len(agregate_masks_texture) > 0:
-        averaged_texture = agregate_mask_texture(agregate_masks_texture)
+        averaged_texture = average_images(agregate_masks_texture)
         texture_path = os.path.join(scene_dir, "mask_texture.png")
         cv2.imwrite(texture_path, cv2.cvtColor(averaged_texture, cv2.COLOR_RGBA2BGRA))
         print(f"Saved aggregated mask texture to {texture_path}")
@@ -263,7 +265,7 @@ def to_colmap(scene_dir, confidence_threshold: float = 2.5, vggt_fixed_resolutio
     print(f"Saved aggregated mask mesh to {os.path.join(scene_dir, f'mask.ply')}")
 
     if args.export_pcl_as_texture:
-        export_as_texture(scene_dir, texture_size, points_3d, points_rgb, points_uvs, points_normals)
+        pcl_to_textures(scene_dir, texture_size, points_3d, points_rgb, points_uvs, points_normals)
 
         
     print("Converting to COLMAP format")
